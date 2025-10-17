@@ -9,12 +9,6 @@ It discovers new digital-twin topics, generates detailed DTDL interface definiti
 - Running [Ollama](https://ollama.ai) instance accessible via HTTP  
 - Installed models (default: `gpt-oss:120b`)
 
-### Python Dependencies
-Install via pip:
-```bash
-pip install requests tqdm
-````
-
 ---
 
 ## ⚙️ Configuration
@@ -116,28 +110,3 @@ python dtdl_generator.py --debug
 ```
 
 You can inspect intermediate text responses and parsed objects to troubleshoot model output.
-
----
-
-## 🧩 Internals
-
-| Module / Function                 | Description                                                     |
-| --------------------------------- | --------------------------------------------------------------- |
-| `discover_topics()`               | Uses LLM to find new digital twin domains, filtering duplicates |
-| `generate_interfaces_for_topic()` | Prompts the LLM for multiple DTDL interfaces per topic          |
-| `force_fill_docker_image_value()` | Ensures every interface has a dummy `dockerImage` value         |
-| `has_deployment_fields()`         | Validates the presence of required DTDL properties              |
-| `iter_jsonl_objects()`            | Safely parses JSON objects from mixed LLM text                  |
-| `main()`                          | Orchestrates discovery, generation, and file writing            |
-
----
-
-## 📁 Output Example Structure
-
-```
-📦 output.jsonl
-├─ line 1: dtmi:vehicle:engine;1
-├─ line 2: dtmi:vehicle:chassis;1
-├─ line 3: dtmi:vehicle:powertrain;1
-└─ ...
-```
