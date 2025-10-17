@@ -1,0 +1,404 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <h1 class="h4 mb-3">Describe what you need</h1>
+    <div class="mb-3">
+      <label class="form-label">Query</label>
+      <textarea class="form-control" id="user_query" rows="5" placeholder="e.g., a diesel sedan for UK, 18-inch wheels, mild tint">I need to simulate a CLS350 CDI 2011 UK model car. The **Mercedes-Benz CLS 350 CDI BlueEFFICIENCY (2011 UK model)** represents the second-generation CLS (C218), a four-door coupé that blends executive-class luxury with strong diesel performance and aerodynamic efficiency. It is powered by a 3.0-litre OM642 V6 turbo-diesel engine producing around 195 kW (265 PS) and 620 Nm of torque, paired with a smooth 7-speed 7G-Tronic automatic gearbox driving the rear wheels. The car accelerates from 0–62 mph in about 6.2 seconds and reaches an electronically limited top speed of 155 mph, while maintaining excellent fuel economy of roughly 47 mpg (UK) combined. With a curb weight of around 1,740 kg, a drag coefficient of 0.26, and a long wheelbase of 2,874 mm, the CLS 350 CDI delivers refined ride comfort and confident handling. Its design combines sculpted coupé styling, premium materials, and advanced technology such as BlueEFFICIENCY energy-saving features, stability systems (ESP/ABS/TCS), and a high-quality COMAND infotainment suite, making it one of the most balanced diesel grand-tourers of its era.</textarea>
+    </div>
+  </div>
+</div>
+
+<div id="steps">
+
+  <!-- STEP 1 -->
+  <div class="card mb-3 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center bg-primary text-white">
+      <span>Step 1 – Decomposition</span>
+      <button class="btn btn-light btn-sm" id="btnStep1">Run Step 1</button>
+    </div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-md-6">
+          <h6>Input → LLM</h6>
+          <pre class="io-col"><code id="in-decomp" class="language-json"></code></pre>
+        </div>
+        <div class="col-md-6">
+          <h6>Output ← LLM</h6>
+          <pre class="io-col"><code id="out-decomp" class="language-json"></code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="card mb-3 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center bg-success text-white">
+      <span>Step 2 – FAISS Retrieval (choose / remove per component)</span>
+      <button class="btn btn-light btn-sm" id="btnStep2" disabled>Run Step 2</button>
+    </div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-md-6">
+          <h6>Input → Embeddings/FAISS</h6>
+          <pre class="io-col"><code id="in-retrieval" class="language-json"></code></pre>
+        </div>
+        <div class="col-md-6">
+          <h6>Output ← Candidates</h6>
+          <div id="choices"></div>
+          <pre class="io-col mt-2"><code id="out-retrieval" class="language-json"></code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<!-- STEP 3 -->
+<div class="card mb-3 shadow-sm">
+  <div class="card-header d-flex justify-content-between align-items-center bg-warning">
+    <span>Step 3 – Property Filling (LLM)</span>
+    <button class="btn btn-dark btn-sm" id="btnStep3" disabled>Run Step 3</button>
+  </div>
+  <div class="card-body">
+    <div class="row g-3">
+      <!-- Left column: input -->
+      <div class="col-md-6">
+        <h6>Input → LLM</h6>
+        <pre class="io-col"><code id="in-fill" class="language-json"></code></pre>
+      </div>
+
+      <!-- Right column: output (two stacked rows) -->
+      <div class="col-md-6 d-flex flex-column gap-3">
+        <!-- Row 1: Full output -->
+        <div>
+          <h6>Output ← Filled (all)</h6>
+          <pre class="io-col"><code id="out-fill" class="language-json"></code></pre>
+        </div>
+
+        <!-- Row 2: Successfully filled table -->
+        <div>
+          <h6>✅ Successfully Filled Properties</h6>
+          <div id="out-fill-success-table" class="io-col p-2 bg-white border" style="overflow:auto"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+  <!-- STEP 4 -->
+  <div class="card mb-3 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center bg-info text-white">
+      <span>Step 4 – Web Backfill (Google PSE + page content)</span>
+      <button class="btn btn-light btn-sm" id="btnStep4" disabled>Run Step 4</button>
+    </div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-md-6">
+          <h6>Input → Web</h6>
+          <pre class="io-col"><code id="in-web" class="language-json"></code></pre>
+        </div>
+        <div class="col-md-6">
+          <h6>Output ← Enriched</h6>
+          <pre class="io-col"><code id="out-web" class="language-json"></code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STEP 5 -->
+  <div class="card mb-3 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center bg-dark text-white">
+      <span>Step 5 – Final DTDL Instances</span>
+      <button class="btn btn-light btn-sm" id="btnStep5" disabled>Run Step 5</button>
+    </div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-md-6">
+          <h6>Input → Generator</h6>
+          <pre class="io-col"><code id="in-instances" class="language-json"></code></pre>
+        </div>
+        <div class="col-md-6">
+          <h6>Output ← Instances</h6>
+          <pre class="io-col"><code id="out-instances" class="language-json"></code></pre>
+          <div class="text-end">
+            <a id="downloadLink" class="btn btn-success d-none" href="#">Download instances.json</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+async function postJSON(url, body) {
+  const r = await fetch(url, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body||{}) });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text()}`);
+  return r.json();
+}
+/**
+ * Sanitize a fill bundle by removing any "source" key in property objects.
+ * Returns a deep clone with "source" removed wherever present.
+ */
+function sanitizeFilledBundle(bundle) {
+  if (!bundle) return bundle;
+  // Deep clone
+  const cloned = JSON.parse(JSON.stringify(bundle));
+  if (cloned && Array.isArray(cloned.properties)) {
+    cloned.properties = cloned.properties.map(p => {
+      if (p && typeof p === 'object') {
+        const { source, ...rest } = p;
+        return rest;
+      }
+      return p;
+    });
+  }
+  return cloned;
+}
+
+/**
+ * showJSON(id, obj)
+ * - writes pretty JSON into the <code> element and triggers highlight.js on that element
+ */
+function showJSON(id, obj) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  try {
+    el.textContent = JSON.stringify(obj, null, 2);
+  } catch (e) {
+    // fallback: toString
+    el.textContent = String(obj);
+  }
+  // highlight.js: highlight this specific code block
+  if (window.hljs && typeof hljs.highlightElement === 'function') {
+    try {
+      hljs.highlightElement(el);
+    } catch (e) {
+      // older versions use highlightBlock
+      if (typeof hljs.highlightBlock === 'function') {
+        try { hljs.highlightBlock(el); } catch (_) {}
+      }
+    }
+  }
+}
+
+/**
+ * Render the successfully filled properties as HTML tables (one table per component).
+ * We remove 'source' before displaying.
+ */
+function renderSuccessTable(successObj) {
+  const host = document.getElementById("out-fill-success-table");
+  host.innerHTML = "";
+  if (!successObj || Object.keys(successObj).length === 0) {
+    host.innerHTML = '<div class="text-muted small">No properties were filled.</div>';
+    return;
+  }
+
+  for (const [comp, props] of Object.entries(successObj)) {
+    const section = document.createElement("div");
+    section.className = "mb-3";
+
+    const title = document.createElement("div");
+    title.innerHTML = `<strong>${comp}</strong>`;
+    section.appendChild(title);
+
+    const table = document.createElement("table");
+    table.className = "table table-sm table-bordered mt-2 mb-0";
+    const thead = document.createElement("thead");
+    thead.innerHTML = `<tr><th>Property</th><th>Value</th><th>Note</th></tr>`;
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    for (const p of props) {
+      // p expected to be {property, value, note, ...} but we sanitized earlier
+      const propName = p.property ?? "";
+      const value = p.value === null || p.value === undefined ? "" : JSON.stringify(p.value);
+      const note = p.note ?? "";
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td style="min-width:140px">${propName}</td><td style="min-width:150px;white-space:pre-wrap">${value}</td><td style="min-width:200px;white-space:pre-wrap">${note}</td>`;
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    section.appendChild(table);
+    host.appendChild(section);
+  }
+}
+
+// Globals
+let gDecomp = null;
+let gRetrieval = null;
+let gFills = null;
+let gWeb = null;
+
+// Build selection directly from the current radios (supports "Remove this component")
+function getCurrentSelectionFromUI() {
+  if (!gRetrieval) return {};
+  const selection = {};
+  for (const comp of Object.keys(gRetrieval)) {
+    const group = `choice-${comp}`;
+    const chosen = document.querySelector(`input[name="${group}"]:checked`);
+    if (!chosen) continue;
+    const idx = parseInt(chosen.value, 10);
+    if (idx === -1) {
+      selection[comp] = { _action: "delete" };
+    } else {
+      selection[comp] = gRetrieval[comp][idx];
+    }
+  }
+  return selection;
+}
+
+function renderChoices(retrieval) {
+  const host = document.getElementById("choices");
+  host.innerHTML = "";
+  for (const [comp, hits] of Object.entries(retrieval)) {
+    const groupId = `choice-${comp}`;
+    const wrap = document.createElement("div");
+    wrap.className = "border rounded p-2 mb-2";
+    const title = document.createElement("div");
+    title.innerHTML = `<strong>${comp}</strong>`;
+    wrap.appendChild(title);
+
+    // Option: delete this component
+    const del = document.createElement("div");
+    del.className = "form-check";
+    const delId = `${groupId}-del`;
+    del.innerHTML = `
+      <input class="form-check-input" type="radio" name="${groupId}" id="${delId}" value="-1">
+      <label class="form-check-label text-danger" for="${delId}">Remove this component</label>`;
+    wrap.appendChild(del);
+
+    if (!hits || !hits.length) {
+      const none = document.createElement("div");
+      none.className = "text-muted small";
+      none.textContent = "No matches.";
+      wrap.appendChild(none);
+    } else {
+      hits.forEach((h, i) => {
+        const id = `${groupId}-${i}`;
+        const div = document.createElement("div");
+        div.className = "form-check";
+        div.innerHTML = `
+          <input class="form-check-input" type="radio" name="${groupId}" id="${id}" value="${i}" ${i===0?'checked':''}>
+          <label class="form-check-label" for="${id}">
+            ${h.label || h.id}
+            <span class="badge bg-secondary">score ${Number(h.score).toFixed(3)}</span>
+            <div class="small text-muted">${h.text || ''}</div>
+          </label>`;
+        wrap.appendChild(div);
+      });
+    }
+    host.appendChild(wrap);
+  }
+}
+
+// Step 1
+document.getElementById("btnStep1").addEventListener("click", async () => {
+  const query = document.getElementById("user_query").value.trim();
+  if(!query){ alert("Please enter a query."); return; }
+  const btn = document.getElementById("btnStep1");
+  btn.disabled = true; btn.textContent = "Running…";
+  try {
+    const dec = await postJSON("/api/decompose", {query});
+    gDecomp = dec.output;
+    showJSON("in-decomp", dec.input);
+    showJSON("out-decomp", gDecomp);
+    document.getElementById("btnStep2").disabled = false;
+  } catch(e){ alert(e.message); }
+  finally { btn.disabled = false; btn.textContent = "Run Step 1"; }
+});
+
+// Step 2
+document.getElementById("btnStep2").addEventListener("click", async () => {
+  if(!gDecomp){ alert("Run Step 1 first."); return; }
+  const btn = document.getElementById("btnStep2");
+  btn.disabled = true; btn.textContent = "Running…";
+  try {
+    const ret = await postJSON("/api/retrieve", {components: gDecomp.components});
+    gRetrieval = ret.output;
+    showJSON("in-retrieval", ret.input);
+    showJSON("out-retrieval", gRetrieval);
+    renderChoices(gRetrieval);
+    document.getElementById("btnStep3").disabled = false;  // no confirmation needed
+  } catch(e){ alert(e.message); }
+  finally { btn.disabled = false; btn.textContent = "Run Step 2"; }
+});
+
+// Step 3 (reads current selection directly)
+document.getElementById("btnStep3").addEventListener("click", async () => {
+  if(!gRetrieval){ alert("Run Step 2 first."); return; }
+  const query = document.getElementById("user_query").value.trim();
+  const selection = getCurrentSelectionFromUI();
+  const btn = document.getElementById("btnStep3");
+  btn.disabled = true; btn.textContent = "Running…";
+  try {
+    const fills = await postJSON("/api/fill", {query, selection});
+    gFills = fills.output;
+
+    // Full raw JSON output (sanitize to remove 'source' wherever present)
+    const sanitizedInput = fills.input ? fills.input : null;
+    showJSON("in-fill", sanitizedInput);
+
+    // For the full output we also sanitize 'source' fields before display
+    const sanitizedOutput = {};
+    for (const [comp, bundle] of Object.entries(gFills || {})) {
+      if (!bundle) { sanitizedOutput[comp] = bundle; continue; }
+      const cloned = sanitizeFilledBundle(bundle.filled ? bundle.filled : bundle);
+      sanitizedOutput[comp] = { chosen: bundle.chosen ?? null, filled: cloned };
+    }
+    showJSON("out-fill", sanitizedOutput);
+
+    // Build success object: properties with non-null values (remove 'source' already)
+    const success = {};
+    for (const [comp, bundle] of Object.entries(gFills || {})) {
+      if (!bundle || !bundle.filled) continue;
+      const props = (bundle.filled.properties || []).filter(p => p.value !== null && p.value !== undefined);
+      if (props.length) {
+        // sanitize props (remove source if any)
+        const sanitizedProps = props.map(p => {
+          const { source, ...rest } = p || {};
+          return rest;
+        });
+        success[comp] = sanitizedProps;
+      }
+    }
+    renderSuccessTable(success);
+
+    document.getElementById("btnStep4").disabled = false;
+  } catch(e){ alert(e.message); }
+  finally { btn.disabled = false; btn.textContent = "Run Step 3"; }
+});
+
+// Step 4
+document.getElementById("btnStep4").addEventListener("click", async () => {
+  if(!gFills){ alert("Run Step 3 first."); return; }
+  const btn = document.getElementById("btnStep4");
+  btn.disabled = true; btn.textContent = "Running…";
+  try {
+    const web = await postJSON("/api/webfill", {fills: gFills});
+    gWeb = web.output;
+    showJSON("in-web",  web.input);
+    showJSON("out-web", gWeb);
+    document.getElementById("btnStep5").disabled = false;
+  } catch(e){ alert(e.message); }
+  finally { btn.disabled = false; btn.textContent = "Run Step 4"; }
+});
+
+// Step 5
+document.getElementById("btnStep5").addEventListener("click", async () => {
+  if(!gWeb){ alert("Run Step 4 first."); return; }
+  const btn = document.getElementById("btnStep5");
+  btn.disabled = true; btn.textContent = "Running…";
+  try {
+    const inst = await postJSON("/api/instances", {webfilled: gWeb});
+    showJSON("in-instances",  inst.input);
+    showJSON("out-instances", inst.output.instances);
+    const a = document.getElementById("downloadLink");
+    a.href = inst.output.download; a.classList.remove("d-none");
+  } catch(e){ alert(e.message); }
+  finally { btn.disabled = false; btn.textContent = "Run Step 5"; }
+});
+</script>
+{% endblock %}
