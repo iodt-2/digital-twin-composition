@@ -115,14 +115,15 @@ DTDL RULES FOR EACH INTERFACE OBJECT:
   "description": "<2–3 sentences describing what this component twins in detail>",
   "contents": [
     {"@type":"Property","name":"dockerImage","schema":"string","value":"registry.local/dtm/$topic_id/<component_name>:v1.0.0"},
-    {"@type":"Property","name":"updateRateHz","schema":"integer","writable":true},
-    {"@type":"Property","name":"version","schema":"string"}
+    <other_properties>,
+    <other_telemetries>
   ]
 }
 
 ADDITIONAL CONSTRAINTS:
 - The 'dockerImage' property MUST include the 'value' exactly like above (dummy path).
 - Use meaningful component names; keep JSON valid per line; no comments/fences/trailing commas.
+- Generate 2-5 other reasonable properties and 2-5 reasonable telemetries based on the current digital twin interface's nature
 """
 )
 
@@ -192,19 +193,6 @@ def looks_like_interface(obj: Dict[str, Any]) -> bool:
         and isinstance(obj.get("displayName"), str)
         and isinstance(obj.get("description"), str)
     )
-
-def has_deployment_fields(i: Dict[str, Any]) -> bool:
-    have_docker = have_rate = have_ver = False
-    for entry in i.get("contents", []):
-        if not isinstance(entry, dict) or entry.get("@type") != "Property":
-            continue
-        if entry.get("name") == "dockerImage" and entry.get("schema") == "string":
-            have_docker = True
-        if entry.get("name") == "updateRateHz" and entry.get("schema") == "integer":
-            have_rate = True
-        if entry.get("name") == "version" and entry.get("schema") == "string":
-            have_ver = True
-    return have_docker and have_rate and have_ver
 
 COMP_RE = re.compile(r"^dtmi:([^:;]+):([^;]+);[0-9]+$")
 
@@ -309,7 +297,7 @@ def generate_interfaces_for_topic(host: str, model: str, topic: Dict[str, str]) 
     text = ollama_generate(host, model, prompt)
     results: List[Dict[str, Any]] = []
     for obj in iter_jsonl_objects(text):
-        if looks_like_interface(obj) and has_deployment_fields(obj):
+        if looks_like_interface(obj):
             force_fill_docker_image_value(obj, tid)
             results.append(obj)
     print(f"[DEBUG] Valid interfaces parsed: {len(results)}")
