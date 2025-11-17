@@ -1,0 +1,3 @@
+min_per_sample=701.627197ms
+max_per_sample=8919.325439ms
+avg_per_sample=1464.010325ms

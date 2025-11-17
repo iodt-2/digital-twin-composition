@@ -1,0 +1,7 @@
+min_seconds_per_sample=1710.068115
+max_seconds_per_sample=26350.732910
+avg_seconds_per_sample=3897.558155
+
+min_human=28m30s
+max_human=7h19m11s
+avg_human=3897.56s/样本
