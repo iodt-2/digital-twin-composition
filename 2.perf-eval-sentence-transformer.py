@@ -21,7 +21,6 @@ models = ["./deberta-base", 'all-MiniLM-L6-v2', 'all-MiniLM-L12-v2', 'all-mpnet-
           'multi-qa-mpnet-base-dot-v1', 'all-distilroberta-v1', 'multi-qa-distilbert-cos-v1',
           'multi-qa-MiniLM-L6-cos-v1',
           './models/base/dt-triplet-v3-deberta-all-final', './models/base/dt-triplet-v3-MiniLM-L6-all-final']
-models = ['./models/base/dt-triplet-v3-MiniLM-L6-all-final']
 
 evaluator = SuperTripletEvaluator(
         anchors=test_dataset["query"],

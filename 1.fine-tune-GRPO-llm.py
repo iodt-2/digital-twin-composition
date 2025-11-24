@@ -6,9 +6,12 @@ import sys
 from datasets import load_dataset, load_from_disk
 from trl import GRPOConfig, GRPOTrainer
 
-dataset = load_from_disk("llm-fill-ft.ds")
+full_dataset = load_from_disk("llm-fill-ft.ds")
 
-# Dummy reward function for demonstration purposes
+train_test = full_dataset.train_test_split(test_size=0.3, seed=42)
+
+dataset = train_test["test"]
+
 def reward_fn(completions, prompts, ground_truth, **kwargs):
 
     rewards = []
