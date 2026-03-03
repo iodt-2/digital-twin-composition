@@ -1,0 +1,241 @@
+# InterTwin: Digital Twin Data Pipeline
+
+This repo contains a practical end-to-end pipeline for **generating mass-scale DTDL v2 interfaces**, **creating “fill” evaluation data**, **fine-tuning models for extraction**, **running inference**, **evaluating results**, and **deploying an interactive agent UI**.
+
+At a high level:
+
+1. **Generate** many digital-twin topics and corresponding **DTDL v2 Interface** objects (JSONL).
+2. **Synthesize** “anchor” paragraphs + structured “answer” instances for evaluation/training.
+3. **Train**:
+   - a SentenceTransformer for semantic retrieval (triplet training), or
+   - a small LLM via GRPO for structured JSON extraction.
+4. **Run inference** to fill properties from anchors and **evaluate** predictions.
+5. **Deploy** an interactive agentic demo (CLI or Flask UI).
+
+---
+
+## Repository layout
+
+The scripts are grouped by stage (prefix numbers reflect the pipeline order):
+
+### 0) Data generation
+- `0.data-gen-dtdl.py` — Mass-scale topic discovery + DTDL Interface generation via Ollama; writes `topics.jsonl` and `interfaces.jsonl`, and supports resume via a done log. :contentReference[oaicite:0]{index=0}
+- `0.data-gen-fill.py` — Converts `interfaces.jsonl` into `fill-eval.jsonl` containing:
+  - `anchor`: a natural-language paragraph describing only **Property** fields (excluding docker/telemetry)
+  - `answer`: a structured instance JSON with the full field set (includes interface id and telemetry placeholders)  
+  Includes checkpointing (`.ckpt`) to resume. :contentReference[oaicite:1]{index=1}
+- `0.data-gen-interface-to-triplet.py` — Builds a triplet dataset (`triplet_database.jsonl`) from `interfaces.jsonl` for training retrieval models. :contentReference[oaicite:2]{index=2}
+
+### 1) Fine-tuning
+- `1.fine-tune-sentence-transformer.py` — Fine-tunes a SentenceTransformer using triplets (MultipleNegativesRankingLoss by default) and evaluates periodically via custom evaluators. :contentReference[oaicite:3]{index=3}
+- `1.fine-tune-GRPO-llm.py` — Fine-tunes `Qwen/Qwen2-0.5B-Instruct` using TRL GRPO with a JSON-validity / key-match style reward function. :contentReference[oaicite:4]{index=4}
+
+### 2) Performance evaluation
+- `2.perf-eval-fill-gen-local.py` — Runs **local Transformers** extraction to fill properties from anchors; supports resume with `.done` indices and writes progress stats. :contentReference[oaicite:5]{index=5}
+- `2.perf-eval-result-eval.py` — Compares filled outputs against `fill-eval.jsonl` answers and reports precision/recall/F1/EM and time stats; can auto-discover predictions under `finished/`. :contentReference[oaicite:6]{index=6}
+- `2.perf-eval-sentence-transformer.py` — Benchmarks multiple embedding models on the triplet test set using `SuperTripletEvaluator`. :contentReference[oaicite:7]{index=7}
+
+### 3) Deployment / demos
+- `3.deploy-adt.py` — A CLI “agentic” loop that talks to Ollama, executes generated Python blocks locally, and iterates steps until “Finished”. :contentReference[oaicite:8]{index=8}
+- `3.deploy-agi-flask.py` — A Flask web UI version of the agent loop with SSE streaming, step cards, and in-browser rendering. :contentReference[oaicite:9]{index=9}
+
+---
+
+## Outputs (files produced)
+
+Common artifacts you’ll see:
+
+- `topics.jsonl` — one topic per line (id/title/brief). :contentReference[oaicite:10]{index=10}
+- `interfaces.jsonl` — one **DTDL v2 Interface JSON object per line** (no wrapper). :contentReference[oaicite:11]{index=11}
+- `interfaces_done.txt` — topic ids that have been processed for interfaces. :contentReference[oaicite:12]{index=12}
+- `fill-eval.jsonl` — one record per interface line: `{ "anchor": "...", "answer": {...} }`, plus a `.ckpt` file for resume. :contentReference[oaicite:13]{index=13}
+- `triplet_database.jsonl` — triplets for retrieval training: `{query, positive, negative}`. :contentReference[oaicite:14]{index=14}
+- Filled inference outputs (per model folder), e.g.:
+  - `checkpoint-5500/filled-output-checkpoint-5500.jsonl`
+  - along with `.done`, `progress-*.json`, and `sample_time_stats-*.txt` :contentReference[oaicite:15]{index=15}
+
+---
+
+## Prerequisites
+
+### Python
+You’ll need Python 3.9+ (recommended) and typical ML tooling depending on which stage you run.
+
+### Ollama (remote or local)
+Several scripts call an Ollama-compatible server:
+- DTDL generation uses `/api/generate` with defaults like `host=http://10.1.1.1:60002` and `model=gpt-oss:120b`. :contentReference[oaicite:16]{index=16}
+- Fill-eval generation uses `/api/chat` and the same default host/model. :contentReference[oaicite:17]{index=17}
+- Deploy scripts also talk to Ollama (`/api/chat`), with defaults overridable via env vars in Flask. :contentReference[oaicite:18]{index=18}
+
+If your Ollama server differs, pass `--host/--model` or set environment variables where supported.
+
+---
+
+## Quickstart (recommended flow)
+
+### Step 1 — Generate topics + interfaces
+Generates many unique digital twin topics and then produces multiple DTDL Interfaces for each topic.
+
+```bash
+python 0.data-gen-dtdl.py \
+  --target-topics 1000 \
+  --topics-batch 50 \
+  --host http://YOUR_OLLAMA_HOST:PORT \
+  --model YOUR_MODEL
+````
+
+This writes:
+
+* `topics.jsonl`
+* `interfaces.jsonl`
+* `interfaces_done.txt`
+  and is designed to be resumable by re-running with `--resume`. 
+
+Optional seeding (to anchor the topic space from a text file):
+
+```bash
+python 0.data-gen-dtdl.py --seed-file cls350_seed.txt --target-topics 1000
+```
+
+
+
+---
+
+### Step 2 — Create fill-eval dataset (anchor + answer)
+
+Converts `interfaces.jsonl` into a dataset suitable for training/eval of extraction.
+
+```bash
+python 0.data-gen-fill.py \
+  --input interfaces.jsonl \
+  --output fill-eval.jsonl \
+  --host http://YOUR_OLLAMA_HOST:PORT \
+  --model YOUR_MODEL
+```
+
+It writes `fill-eval.jsonl` and a checkpoint file `fill-eval.jsonl.ckpt` so you can resume safely. 
+
+---
+
+### Step 3a — Train a SentenceTransformer (retrieval)
+
+First build triplets:
+
+```bash
+python 0.data-gen-interface-to-triplet.py
+```
+
+This reads `interfaces.jsonl` and writes `triplet_database.jsonl`. 
+
+Then fine-tune:
+
+```bash
+python 1.fine-tune-sentence-transformer.py
+```
+
+This trains using a triplet-style objective (MultipleNegativesRankingLoss by default), logs to Weights & Biases, and saves models under `models/...`. 
+
+(Optional) benchmark multiple embedding models:
+
+```bash
+python 2.perf-eval-sentence-transformer.py
+```
+
+
+
+---
+
+### Step 3b — Fine-tune a small LLM for JSON extraction (GRPO)
+
+If you have a dataset on disk at `llm-fill-ft.ds`, you can run GRPO fine-tuning:
+
+```bash
+python 1.fine-tune-GRPO-llm.py
+```
+
+This uses TRL’s `GRPOTrainer` and saves to `Qwen2-0.5B-GRPO/`. 
+
+---
+
+### Step 4 — Run local extraction inference (fill properties)
+
+This script reads `fill-eval.jsonl`, looks up property schemas from `interfaces.jsonl`, and uses a local Transformers text-generation pipeline to extract only the specified properties.
+
+```bash
+# Optionally point to a local model checkpoint
+export LOCAL_MODEL="Qwen2-0.5B-GRPO/checkpoint-5500"
+
+python 2.perf-eval-fill-gen-local.py
+```
+
+Outputs are written under a folder named after your model path tail (e.g. `checkpoint-5500/`), with resume support via a `.done` file and progress stats. 
+
+---
+
+### Step 5 — Evaluate prediction quality
+
+Compare one or more filled outputs against `fill-eval.jsonl`:
+
+```bash
+python 2.perf-eval-result-eval.py \
+  --eval fill-eval.jsonl \
+  --pred checkpoint-5500/filled-output-checkpoint-5500.jsonl \
+  --tol 0.0 \
+  --top_percent 70
+```
+
+If you omit `--pred`, it can scan `finished/` for `*.jsonl` outputs automatically and print a summary table. 
+
+---
+
+## Deployment demos
+
+### CLI agent demo
+
+Runs an iterative agent loop: streams Ollama responses, executes any generated python code blocks, and continues until it sees `Finished`. 
+
+```bash
+python 3.deploy-adt.py
+```
+
+### Flask UI agent demo
+
+Starts a local web UI with step-by-step streaming (SSE), allowing you to enter a query, run the agent, and inspect assistant output + execution output per step. Defaults can be overridden with env vars `OLLAMA_HOST` and `OLLAMA_MODEL`. 
+
+```bash
+export OLLAMA_HOST="http://YOUR_OLLAMA_HOST:PORT"
+export OLLAMA_MODEL="YOUR_MODEL"
+python 3.deploy-agi-flask.py
+# then open http://127.0.0.1:5000
+```
+
+
+
+---
+
+## Notes on the DTDL format generated
+
+The generator enforces a few key conventions:
+
+* Output is **JSONL** (one Interface object per line), no wrappers. 
+* Every interface includes a `dockerImage` property with a `value` like:
+  `registry.local/dtm/<topic_id>/<component_name>:v1.0.0` 
+* Interfaces use DTDL v2 context and `@type: "Interface"`. 
+
+---
+
+## Troubleshooting
+
+---
+
+## License
+
+Add your preferred license here (e.g., MIT/Apache-2.0) and include a `LICENSE` file.
+
+---
+
+## Acknowledgements
+
+* DTDL v2 format conventions (Interface/Property/Telemetry)
+* Hugging Face Transformers & SentenceTransformers
+* TRL (GRPO) for RL-style fine-tuning

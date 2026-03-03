@@ -6,14 +6,13 @@ from pathlib import Path
 import requests
 
 # ----------------- 配置 -----------------
-# OpenAI 兼容 API（Google 的兼容端点）
 
 OPENAI_BASE_URL = os.environ.get(
     "OPENAI_BASE_URL",
     "https://generativelanguage.googleapis.com/v1beta/openai",
 )
-# 优先使用 OPENAI_API_KEY，其次 GENAI_API_KEY
-OPENAI_API_KEY = "AIzaSyCXzjUfnalyyQwqFaHmtBC-pJkuadYUk8I"
+
+OPENAI_API_KEY = "api_key"
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "models/gemini-2.5-pro")
 
 INTERFACES_PATH = Path("interfaces.jsonl")
