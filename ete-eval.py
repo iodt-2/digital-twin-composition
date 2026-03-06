@@ -25,6 +25,15 @@ try:
 except ImportError:
     requests = None
 
+# --- (NEW) Optional local Qwen backend ---
+try:
+    import torch  # type: ignore
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+except Exception:
+    torch = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+
 
 # --- Configs from env ---
 DEFAULT_HOST = os.getenv("OLLAMA_HOST", "http://10.1.1.49:60002")
@@ -35,6 +44,9 @@ FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "./models/faiss.index")
 EMBEDDINGS_PATH = os.getenv("EMBEDDINGS_PATH", "./models/embeddings.npy")
 METADATA_PATH = os.getenv("METADATA_PATH", "./models/metadata.json")
 SENTENCE_TRANSFORMER_PATH = os.getenv("SENTENCE_TRANSFORMER_PATH", "./models/MiniLM-L6-based-new-triplets-final")
+
+# local qwen model path
+DEFAULT_QWEN_PATH = os.getenv("QWEN_MODEL_PATH", "./models/Qwen2-0.5B-GRPO-Fill-In")
 
 # Ignore keys for direct strict compare (hard ignore; not prompt-based)
 IGNORE_KEYS = {"@id", "displayName", "dockerImage"}
@@ -300,6 +312,57 @@ def ollama_generate(prompt: str, host: str, model: str, timeout_s: int = 120) ->
     if isinstance(obj2, dict) and isinstance(obj2.get("message"), dict):
         return str(obj2["message"].get("content", ""))
     raise RuntimeError(f"Unexpected ollama response (no requests): {obj2}")
+
+
+# -------------------------
+# Local Qwen helpers
+# -------------------------
+_QWEN_CACHE: Dict[str, Any] = {}
+
+
+def qwen_generate(
+    prompt: str,
+    model_path: str,
+    max_new_tokens: int = 1024,
+    temperature: float = 0.0,
+) -> str:
+    if AutoTokenizer is None or AutoModelForCausalLM is None or torch is None:
+        raise SystemExit(
+            "Local Qwen backend requires transformers + torch.\n"
+            "Install with: pip install transformers torch\n"
+        )
+
+    key = f"{model_path}"
+    if key not in _QWEN_CACHE:
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=(torch.float16 if torch.cuda.is_available() else torch.float32),
+            device_map="auto",
+        )
+        _QWEN_CACHE[key] = (tok, mdl)
+    tok, mdl = _QWEN_CACHE[key]
+
+    inputs = tok(prompt, return_tensors="pt")
+    inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
+
+    # deterministic by default (temperature=0)
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=(temperature > 0.0),
+        temperature=temperature,
+        pad_token_id=getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", None),
+        eos_token_id=getattr(tok, "eos_token_id", None),
+    )
+    with torch.no_grad():
+        out = mdl.generate(**inputs, **gen_kwargs)
+
+    text = tok.decode(out[0], skip_special_tokens=True)
+    # try to remove echoed prompt if present
+    if text.startswith(prompt):
+        text = text[len(prompt) :]
+    return text.strip()
 
 
 def parse_model_json_output(text: str) -> Any:
@@ -628,6 +691,17 @@ def main() -> None:
     parser.add_argument("--no_fillin", action="store_true", help="Disable Ollama fill-in + evaluation entirely.")
     parser.add_argument("--no_decompose", action="store_true", help="Disable decomposition/composition even if sim is low.")
     parser.add_argument("--no_verify", action="store_true", help="Disable composed-case LLM verify step (still prints instance).")
+
+    # (NEW) fill-in backend selection
+    parser.add_argument(
+        "--fill_backend",
+        choices=["ollama", "qwen"],
+        default="ollama",
+        help="Fill-in model backend: ollama or local qwen (default: ollama).",
+    )
+    parser.add_argument("--qwen_path", type=str, default=DEFAULT_QWEN_PATH, help="Local Qwen model path (HF format).")
+    parser.add_argument("--qwen_max_new_tokens", type=int, default=1024, help="Max new tokens for local Qwen generation.")
+    parser.add_argument("--qwen_temperature", type=float, default=0.0, help="Temperature for local Qwen generation.")
     args = parser.parse_args()
 
     # Load index
@@ -686,7 +760,22 @@ def main() -> None:
         raise FileNotFoundError(f"SENTENCE_TRANSFORMER_PATH not found: {SENTENCE_TRANSFORMER_PATH}")
     embed_model = SentenceTransformer(SENTENCE_TRANSFORMER_PATH)
 
+    # choose fill-in generator
+    def fillin_generate(prompt: str) -> str:
+        if args.fill_backend == "ollama":
+            return ollama_generate(prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
+        # local qwen
+        if not os.path.exists(args.qwen_path):
+            raise FileNotFoundError(f"--qwen_path not found: {args.qwen_path}")
+        return qwen_generate(
+            prompt,
+            model_path=args.qwen_path,
+            max_new_tokens=args.qwen_max_new_tokens,
+            temperature=args.qwen_temperature,
+        )
+
     print(f"Ollama host/model: {DEFAULT_HOST} / {DEFAULT_MODEL}")
+    print(f"Fill-in backend: {args.fill_backend}" + (f" (qwen_path={args.qwen_path})" if args.fill_backend == "qwen" else ""))
     print(f"Dataset: {DEFAULT_DATASET_PATH}")
     print(f"Index: {FAISS_INDEX_PATH}   metric={metric}   normalize_queries={normalize}")
     print("=" * 130)
@@ -810,7 +899,7 @@ def main() -> None:
             print("[fill-in] prompt:\n" + fill_prompt + "\n")
 
             try:
-                model_text = ollama_generate(fill_prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
+                model_text = fillin_generate(fill_prompt)
                 inst_any = parse_model_json_output(model_text)
             except Exception as e:
                 print(f"[fill-in] ERROR: {e}")
@@ -858,7 +947,7 @@ def main() -> None:
             print("[fill-in] prompt:\n" + fill_prompt + "\n")
 
             try:
-                model_text = ollama_generate(fill_prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
+                model_text = fillin_generate(fill_prompt)
                 inst_any = parse_model_json_output(model_text)
             except Exception as e:
                 print(f"[fill-in] ERROR: {e}")
@@ -893,6 +982,7 @@ def main() -> None:
             print("[verify] prompt:\n" + verify_prompt + "\n")
 
             try:
+                # verify still uses ollama (unchanged)
                 verify_text = ollama_generate(verify_prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
                 verify_obj = parse_model_json_output(verify_text)
             except Exception as e:
