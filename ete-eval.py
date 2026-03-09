@@ -6,39 +6,19 @@ import re
 import json
 import ast
 import argparse
-from typing import Any, Dict, List, Tuple, Optional
-
+from typing import Any, Dict, List, Tuple, Optional, Set
 import numpy as np
-
-try:
-    import faiss  # type: ignore
-except ImportError as e:
-    raise SystemExit(
-        "faiss is not installed. Install with: pip install faiss-cpu (or faiss-gpu)\n"
-        f"Original error: {e}"
-    )
-
+import faiss
 from sentence_transformers import SentenceTransformer
-
-try:
-    import requests  # type: ignore
-except ImportError:
-    requests = None
-
-# --- (NEW) Optional local Qwen backend ---
-try:
-    import torch  # type: ignore
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
-except Exception:
-    torch = None
-    AutoModelForCausalLM = None
-    AutoTokenizer = None
+import requests
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # --- Configs from env ---
 DEFAULT_HOST = os.getenv("OLLAMA_HOST", "http://10.1.1.49:60002")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
-DEFAULT_DATASET_PATH = os.getenv("ETE_EVAL_PATH", "./data/syntactic.jsonl")
+DEFAULT_DATASET_PATH = os.getenv("ETE_EVAL_PATH", "./data/dataset_mid.jsonl")
 
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "./models/faiss.index")
 EMBEDDINGS_PATH = os.getenv("EMBEDDINGS_PATH", "./models/embeddings.npy")
@@ -48,8 +28,14 @@ SENTENCE_TRANSFORMER_PATH = os.getenv("SENTENCE_TRANSFORMER_PATH", "./models/Min
 # local qwen model path
 DEFAULT_QWEN_PATH = os.getenv("QWEN_MODEL_PATH", "./models/Qwen2-0.5B-GRPO-Fill-In")
 
+# dataset_original for subsystem exact-match evaluation
+DATASET_ORIGINAL_PATH = os.getenv("DATASET_ORIGINAL_PATH", "./data/dataset_original.jsonl")
+
+# evaluation output
+DEFAULT_EVAL_OUT_PATH = os.getenv("EVAL_OUT_PATH", "./outputs/evaluation_results.jsonl")
+
 # Ignore keys for direct strict compare (hard ignore; not prompt-based)
-IGNORE_KEYS = {"@id", "displayName", "dockerImage"}
+IGNORE_KEYS = {"@id", "displayName", "dockerImage", "interface"}
 
 
 # -------------------------
@@ -93,6 +79,97 @@ def pretty(obj: Any) -> str:
 
 def minified_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def append_jsonl(path: str, row: Dict[str, Any]) -> None:
+    ensure_parent_dir(path)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def write_json(path: str, obj: Any) -> None:
+    ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+# -------------------------
+# dataset_original helpers
+# -------------------------
+def extract_group_id_from_dtmi(dtmi: str) -> str:
+    """
+    Example:
+      dtmi:smart_window_tint_control_system:tint_controller;1
+    -> smart_window_tint_control_system
+    """
+    if not isinstance(dtmi, str):
+        return ""
+    s = dtmi.strip()
+    if not s:
+        return ""
+    parts = s.split(":")
+    if len(parts) >= 3 and parts[0] == "dtmi":
+        return parts[1].strip()
+    return ""
+
+
+def load_dataset_original_group_index(path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Read dataset_original.jsonl only once and build:
+      group_id -> {
+        "faiss_ids_zero_based": [...],
+        "line_numbers_one_based": [...],
+        "interfaces": [...]
+      }
+
+    Assumption:
+      faiss_id corresponds to zero-based line index/order in dataset_original.jsonl.
+      One-based line numbers are also recorded for debugging/inspection.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"DATASET_ORIGINAL_PATH not found: {path}")
+
+    rows = load_jsonl(path)
+    group_map: Dict[str, Dict[str, Any]] = {}
+
+    for idx0, row in enumerate(rows):
+        iface = row.get("interface")
+        if not isinstance(iface, dict):
+            continue
+
+        dtmi = iface.get("@id")
+        if not isinstance(dtmi, str):
+            continue
+
+        gid = extract_group_id_from_dtmi(dtmi)
+        if not gid:
+            continue
+
+        if gid not in group_map:
+            group_map[gid] = {
+                "faiss_ids_zero_based": [],
+                "line_numbers_one_based": [],
+                "interfaces": [],
+            }
+
+        group_map[gid]["faiss_ids_zero_based"].append(idx0)
+        group_map[gid]["line_numbers_one_based"].append(idx0 + 1)
+        group_map[gid]["interfaces"].append(
+            {
+                "faiss_id": idx0,
+                "line_number": idx0 + 1,
+                "@id": dtmi,
+                "displayName": iface.get("displayName"),
+            }
+        )
+
+    return group_map
 
 
 # -------------------------
@@ -209,9 +286,9 @@ def get_property_fields_from_interface(interface_obj: Any) -> List[Dict[str, Any
     return [c for c in contents if c.get("@type") == "Property" and "name" in c]
 
 
-def get_telemetry_field_names_from_interface(interface_obj: Any) -> set:
+def get_telemetry_field_names_from_interface(interface_obj: Any) -> Set[str]:
     contents = get_contents_list_from_interface(interface_obj)
-    names = set()
+    names: Set[str] = set()
     for c in contents:
         if c.get("@type") == "Telemetry" and "name" in c:
             names.add(str(c["name"]))
@@ -347,7 +424,6 @@ def qwen_generate(
     inputs = tok(prompt, return_tensors="pt")
     inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
 
-    # deterministic by default (temperature=0)
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=(temperature > 0.0),
@@ -359,9 +435,8 @@ def qwen_generate(
         out = mdl.generate(**inputs, **gen_kwargs)
 
     text = tok.decode(out[0], skip_special_tokens=True)
-    # try to remove echoed prompt if present
     if text.startswith(prompt):
-        text = text[len(prompt) :]
+        text = text[len(prompt):]
     return text.strip()
 
 
@@ -379,7 +454,7 @@ def parse_model_json_output(text: str) -> Any:
         if not candidates:
             return s0
         l, r = sorted(candidates, key=lambda x: x[0])[0]
-        return s0[l : r + 1]
+        return s0[l:r + 1]
 
     if not (s.startswith("{") or s.startswith("[")):
         s = _slice_braces(s)
@@ -446,18 +521,17 @@ def compose_interfaces(
         iface = pack.get("interface")
         iface_u = unwrap_interface(iface)
 
-        fallback = f"sub_system_{i+1}"
+        fallback = f"sub_system_{i + 1}"
         name = choose_subsystem_name(iface_u, fallback=fallback)
         key = f"{name}_properties_and_telemetries"
         if key in used_keys:
-            key = f"{name}_{i+1}_properties_and_telemetries"
+            key = f"{name}_{i + 1}_properties_and_telemetries"
         used_keys.add(key)
 
         contents = []
         if isinstance(iface_u, dict) and isinstance(iface_u.get("contents"), list):
             contents = [c for c in iface_u["contents"] if isinstance(c, dict)]
         else:
-            # if iface_u isn't a standard interface dict, try generic extraction
             contents = get_contents_list_from_interface(iface_u)
 
         composed[key] = contents
@@ -466,9 +540,12 @@ def compose_interfaces(
                 "subsystem_idx": i + 1,
                 "faiss_id": faiss_id,
                 "sub_query": pack.get("sub_query"),
+                "score": pack.get("score"),
                 "subsystem_key": key,
                 "contents_len": len(contents),
                 "interface_id_display": interface_id_display(iface_u),
+                "interface_id": iface_u.get("@id") if isinstance(iface_u, dict) else None,
+                "displayName": iface_u.get("displayName") if isinstance(iface_u, dict) else None,
             }
         )
 
@@ -476,17 +553,11 @@ def compose_interfaces(
 
 
 # -------------------------
-# Fill-in prompts (UPDATED)
+# Fill-in prompts
 # -------------------------
 def build_fillin_prompt_direct_flat_instance(description_text: str, interface_obj: Dict[str, Any]) -> str:
-    """
-    Direct (no composition) case:
-    - Ask model to return a FULL initiated instance that matches expected_output format (flat keys),
-      but ONLY for property fields (telemetries may be included by expected_output; we ignore telemetries in compare).
-    """
     props = get_property_fields_from_interface(interface_obj)
     prop_names = [str(p["name"]) for p in props if "name" in p]
-    # also include 'interface' key expected by your ground truth
     required_keys = ["interface"] + prop_names
 
     iface_id = interface_obj.get("@id") if isinstance(interface_obj.get("@id"), str) else ""
@@ -509,20 +580,11 @@ def build_fillin_prompt_direct_flat_instance(description_text: str, interface_ob
 
 
 def build_fillin_prompt_composed_nested_instance(description_text: str, composed_interface: Dict[str, Any]) -> str:
-    """
-    Composed case:
-    - Ask model to output an initiated instance JSON with nested per-subsystem properties to avoid conflicts.
-    - Output format MUST be:
-      {"interface": "...", "subsystems": {"<subsystem_name>": {"prop": value_or_null, ...}, ...}}
-    - We DO NOT request telemetries values (not checked).
-    """
     blocks = get_subsystem_blocks_from_composed_interface(composed_interface)
     iface_id = composed_interface.get("@id") if isinstance(composed_interface.get("@id"), str) else ""
 
-    # Build exact schema spec: subsystem_name -> property list
     schema_spec: Dict[str, List[str]] = {}
     for key, contents in blocks:
-        # subsystem name is key prefix
         subsystem_name = key.replace("_properties_and_telemetries", "")
         schema_spec[subsystem_name] = get_property_names_from_contents(contents)
 
@@ -549,7 +611,7 @@ def build_fillin_prompt_composed_nested_instance(description_text: str, composed
 
 
 # -------------------------
-# Evaluation (UPDATED)
+# Evaluation helpers
 # -------------------------
 def normalize_value(v: Any) -> Any:
     if v is None:
@@ -560,7 +622,6 @@ def normalize_value(v: Any) -> Any:
         s = v.strip()
         if s.lower() in ("null", "none", ""):
             return None
-        # attempt numeric parsing
         try:
             if "." in s or "e" in s.lower():
                 return float(s)
@@ -575,18 +636,9 @@ def strict_compare_direct_instance(
     expected_output: Dict[str, Any],
     interface_obj: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Direct case evaluation:
-    - Compare keys & values one-to-one against expected_output
-    - Ignore IGNORE_KEYS
-    - Ignore telemetry keys (derived from interface)
-    """
     telemetry_keys = get_telemetry_field_names_from_interface(interface_obj)
 
-    # Expected keys we care about: all keys from expected_output excluding ignored + telemetries
     expected_keys = [k for k in expected_output.keys() if k not in IGNORE_KEYS and k not in telemetry_keys]
-
-    # Pred must have exactly these keys (no more, no less) for strictness
     pred_keys = [k for k in predicted_instance.keys() if k not in IGNORE_KEYS and k not in telemetry_keys]
 
     expected_set = set(expected_keys)
@@ -619,25 +671,125 @@ def strict_compare_direct_instance(
     }
 
 
+def evaluate_subsystem_exact_match(
+    desired_group_id: Optional[str],
+    manifest: Optional[List[Dict[str, Any]]],
+    dataset_original_group_map: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    retrieved_ids: List[int] = []
+    if manifest:
+        for m in manifest:
+            fid = m.get("faiss_id")
+            if isinstance(fid, int) and fid >= 0:
+                retrieved_ids.append(fid)
+
+    report: Dict[str, Any] = {
+        "desired_group_id": desired_group_id,
+        "retrieved_faiss_ids": retrieved_ids,
+        "retrieved_count": len(retrieved_ids),
+        "overall_ok": False,
+        "reason": "",
+        "correct_faiss_ids_from_expected_lines": [],
+        "invalid_retrieved_faiss_ids": [],
+        "valid_retrieved_faiss_ids": [],
+    }
+
+    if not desired_group_id:
+        report["reason"] = "desired group_id missing in ETE_EVAL_PATH row"
+        return report
+
+    target = dataset_original_group_map.get(desired_group_id)
+    if not target:
+        report["reason"] = f"group_id={desired_group_id!r} not found in dataset_original"
+        return report
+
+    expected_line_numbers_one_based = [
+        int(x) for x in target.get("line_numbers_one_based", [])
+    ]
+    allowed_faiss_ids = sorted({ln - 1 for ln in expected_line_numbers_one_based if isinstance(ln, int) and ln >= 1})
+
+    valid_retrieved = [fid for fid in retrieved_ids if fid in set(allowed_faiss_ids)]
+    invalid_retrieved = [fid for fid in retrieved_ids if fid not in set(allowed_faiss_ids)]
+
+    report["correct_faiss_ids_from_expected_lines"] = allowed_faiss_ids
+    report["valid_retrieved_faiss_ids"] = valid_retrieved
+    report["invalid_retrieved_faiss_ids"] = invalid_retrieved
+    report["overall_ok"] = (len(invalid_retrieved) == 0)
+    report["reason"] = (
+        "all retrieved faiss_ids are in the correct lines"
+        if report["overall_ok"]
+        else "some retrieved faiss_ids are not correct"
+    )
+    return report
+
+
+def build_verify_prompt_for_direct(
+    description_text: str,
+    interface_obj: Dict[str, Any],
+    predicted_instance: Dict[str, Any],
+    expected_output: Dict[str, Any],
+) -> str:
+    telemetry_keys = sorted(list(get_telemetry_field_names_from_interface(interface_obj)))
+    expected_keys = [
+        k for k in expected_output.keys()
+        if k not in IGNORE_KEYS and k not in telemetry_keys
+    ]
+
+    prompt = (
+        "You are a strict but semantically-aware verification assistant.\n"
+        "You will be given:\n"
+        "1) DESCRIPTION text\n"
+        "2) An Interface schema\n"
+        "3) A PREDICTED instance JSON\n"
+        "4) An EXPECTED instance JSON\n\n"
+        "Task:\n"
+        "- Verify each field in PREDICTED against EXPECTED.\n"
+        "- Final judgment must be semantic, not only string-exact.\n"
+        "- Treat equivalent expressions as MATCH when they clearly refer to the same value.\n"
+        "- Examples of MATCH:\n"
+        "  - abbreviation vs full form: 'nickel-manganese-cobalt (NMC)' == 'NMC'\n"
+        "  - different unicode hyphen characters vs normal hyphen\n"
+        "  - harmless formatting differences, capitalization differences, spacing differences\n"
+        "  - numeric string vs numeric value when they represent the same value\n"
+        "- Mark MISMATCH only if the values are genuinely different in meaning.\n"
+        "- Ignore keys in this fixed ignore list: "
+        f"{sorted(list(IGNORE_KEYS))}\n"
+        "- Ignore telemetry fields entirely: "
+        f"{telemetry_keys}\n"
+        "- Only evaluate these keys:\n"
+        f"{expected_keys}\n\n"
+        "Output requirements:\n"
+        "- Return ONLY minified JSON.\n"
+        "- Use EXACTLY this JSON shape:\n"
+        '{"overall_result":"PASS|FAIL","summary":{"matched":0,"mismatched":0,"accuracy":0.0},"fields":{"<key>":{"pred":null,"gt":null,"result":"PASS|FAIL","reason":""}},"notes":""}\n'
+        "- Keep reason concise.\n"
+        "- If values are semantically equivalent, result MUST be PASS.\n\n"
+        "INTERFACE:\n"
+        f"{minified_json(interface_obj)}\n\n"
+        "PREDICTED INSTANCE:\n"
+        f"{minified_json(predicted_instance)}\n\n"
+        "EXPECTED INSTANCE:\n"
+        f"{minified_json(expected_output)}\n\n"
+        "DESCRIPTION:\n"
+        f"{description_text}\n"
+    )
+    return prompt
+
+def build_direct_final_eval(
+    raw_strict_eval: Dict[str, Any],
+    llm_verify_obj: Dict[str, Any],
+) -> Dict[str, Any]:
+    overall_ok = (llm_verify_obj.get("overall_result") == "PASS")
+
+    return {
+        "mode": "direct_llm_verify",
+        "overall_ok": overall_ok,
+        "final_source": "llm_verify",
+        "raw_strict_compare": raw_strict_eval,
+        "llm_verify": llm_verify_obj,
+    }
+
 def build_verify_prompt_for_composed(description_text: str, composed_interface: Dict[str, Any], instance_obj: Dict[str, Any]) -> str:
-    """
-    Composed case verification:
-    - LLM checks each subsystem's properties are filled reasonably from DESCRIPTION, no hallucination/inference.
-    - No comparison to expected_output.
-    - Output JSON format:
-      {
-        "overall_result": "PASS"|"FAIL",
-        "subsystems": {
-          "<name>": {
-            "result": "PASS"|"FAIL",
-            "matches": [{"key": "...", "value": ..., "evidence": "quote or short evidence"}...],
-            "mismatches": [{"key": "...", "value": ..., "reason": "..."}...],
-            "notes": "..."
-          }, ...
-        },
-        "notes": "..."
-      }
-    """
     blocks = get_subsystem_blocks_from_composed_interface(composed_interface)
     schema_spec: Dict[str, List[str]] = {}
     for key, contents in blocks:
@@ -672,6 +824,45 @@ def build_verify_prompt_for_composed(description_text: str, composed_interface: 
     return prompt
 
 
+def update_summary_counts(summary: Dict[str, Any], record: Dict[str, Any]) -> None:
+    summary["queries_total"] += 1
+
+    path = record.get("path")
+    if path == "direct":
+        summary["direct_total"] += 1
+        direct_eval = record.get("direct_eval")
+        if isinstance(direct_eval, dict):
+            if direct_eval.get("overall_ok") is True:
+                summary["direct_pass"] += 1
+            else:
+                summary["direct_fail"] += 1
+        else:
+            summary["direct_fail"] += 1
+
+    elif path == "decompose+compose":
+        summary["composed_total"] += 1
+
+        subsystem_eval = record.get("subsystem_exact_match_eval")
+        if isinstance(subsystem_eval, dict):
+            if subsystem_eval.get("overall_ok") is True:
+                summary["subsystem_exact_match_pass"] += 1
+            else:
+                summary["subsystem_exact_match_fail"] += 1
+        else:
+            summary["subsystem_exact_match_fail"] += 1
+
+        verify_eval = record.get("verify_eval")
+        if isinstance(verify_eval, dict):
+            if verify_eval.get("overall_result") == "PASS":
+                summary["verify_pass"] += 1
+            else:
+                summary["verify_fail"] += 1
+        elif record.get("verify_skipped"):
+            summary["verify_skipped"] += 1
+        else:
+            summary["verify_fail"] += 1
+
+
 # -------------------------
 # main
 # -------------------------
@@ -684,7 +875,6 @@ def main() -> None:
     parser.add_argument("--metric", choices=["auto", "ip", "l2"], default="auto", help="FAISS metric: ip or l2.")
     parser.add_argument("--timeout", type=int, default=120, help="Ollama request timeout (seconds).")
 
-    # UPDATED default min_sim
     parser.add_argument("--min_sim", type=float, default=0.75, help="If top1 sim < min_sim, run decomposition/composition.")
     parser.add_argument("--max_subsystems", type=int, default=5, help="Max number of subsystems after decomposition.")
 
@@ -692,7 +882,6 @@ def main() -> None:
     parser.add_argument("--no_decompose", action="store_true", help="Disable decomposition/composition even if sim is low.")
     parser.add_argument("--no_verify", action="store_true", help="Disable composed-case LLM verify step (still prints instance).")
 
-    # (NEW) fill-in backend selection
     parser.add_argument(
         "--fill_backend",
         choices=["ollama", "qwen"],
@@ -702,7 +891,22 @@ def main() -> None:
     parser.add_argument("--qwen_path", type=str, default=DEFAULT_QWEN_PATH, help="Local Qwen model path (HF format).")
     parser.add_argument("--qwen_max_new_tokens", type=int, default=1024, help="Max new tokens for local Qwen generation.")
     parser.add_argument("--qwen_temperature", type=float, default=0.0, help="Temperature for local Qwen generation.")
+
+    parser.add_argument("--dataset_original_path", type=str, default=DATASET_ORIGINAL_PATH, help="dataset_original.jsonl path.")
+    parser.add_argument("--eval_out", type=str, default=DEFAULT_EVAL_OUT_PATH, help="Per-query evaluation output JSONL path.")
+    parser.add_argument("--summary_out", type=str, default="", help="Summary JSON output path. Default: <eval_out>.summary.json")
     args = parser.parse_args()
+
+    summary_out = args.summary_out.strip() if isinstance(args.summary_out, str) else ""
+    if not summary_out:
+        summary_out = args.eval_out + ".summary.json"
+
+    ensure_parent_dir(args.eval_out)
+    ensure_parent_dir(summary_out)
+
+    # reset per-run output files
+    with open(args.eval_out, "w", encoding="utf-8") as f:
+        pass
 
     # Load index
     if not os.path.exists(FAISS_INDEX_PATH):
@@ -744,13 +948,25 @@ def main() -> None:
     if args.limit and args.limit > 0:
         rows = rows[:args.limit]
 
+    dataset_original_group_map = load_dataset_original_group_index(args.dataset_original_path)
+
     queries: List[str] = []
     expected_outputs: List[Any] = []
+    desired_group_ids: List[Optional[str]] = []
+
     for r in rows:
         q = r.get("query")
         if isinstance(q, str) and q.strip():
             queries.append(q.strip())
             expected_outputs.append(r.get("expected_output"))
+
+            iface = r.get("interface")
+            gid = None
+            if isinstance(iface, dict):
+                raw_gid = iface.get("group_id")
+                if isinstance(raw_gid, str) and raw_gid.strip():
+                    gid = raw_gid.strip()
+            desired_group_ids.append(gid)
 
     if not queries:
         raise ValueError("No valid 'query' strings found in dataset slice.")
@@ -760,11 +976,9 @@ def main() -> None:
         raise FileNotFoundError(f"SENTENCE_TRANSFORMER_PATH not found: {SENTENCE_TRANSFORMER_PATH}")
     embed_model = SentenceTransformer(SENTENCE_TRANSFORMER_PATH)
 
-    # choose fill-in generator
     def fillin_generate(prompt: str) -> str:
         if args.fill_backend == "ollama":
             return ollama_generate(prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
-        # local qwen
         if not os.path.exists(args.qwen_path):
             raise FileNotFoundError(f"--qwen_path not found: {args.qwen_path}")
         return qwen_generate(
@@ -777,18 +991,58 @@ def main() -> None:
     print(f"Ollama host/model: {DEFAULT_HOST} / {DEFAULT_MODEL}")
     print(f"Fill-in backend: {args.fill_backend}" + (f" (qwen_path={args.qwen_path})" if args.fill_backend == "qwen" else ""))
     print(f"Dataset: {DEFAULT_DATASET_PATH}")
+    print(f"dataset_original: {args.dataset_original_path}")
+    print(f"Eval out: {args.eval_out}")
+    print(f"Summary out: {summary_out}")
     print(f"Index: {FAISS_INDEX_PATH}   metric={metric}   normalize_queries={normalize}")
     print("=" * 130)
+
+    summary: Dict[str, Any] = {
+        "queries_total": 0,
+        "direct_total": 0,
+        "direct_pass": 0,
+        "direct_fail": 0,
+        "composed_total": 0,
+        "subsystem_exact_match_pass": 0,
+        "subsystem_exact_match_fail": 0,
+        "verify_pass": 0,
+        "verify_fail": 0,
+        "verify_skipped": 0,
+        "eval_out": args.eval_out,
+        "summary_out": summary_out,
+        "dataset": DEFAULT_DATASET_PATH,
+        "dataset_original": args.dataset_original_path,
+    }
 
     for qi, q in enumerate(queries):
         print(f"[{qi}] query:\n{q}\n")
 
         exp = expected_outputs[qi]
+        desired_group_id = desired_group_ids[qi]
+
         print("expected_output (ground truth instance):")
         print(pretty(exp))
         print("")
+        print(f"desired_group_id: {desired_group_id!r}")
+        print("")
 
-        # initial retrieval
+        record: Dict[str, Any] = {
+            "query_index": qi,
+            "query": q,
+            "expected_output": exp,
+            "desired_group_id": desired_group_id,
+            "path": None,
+            "top1": None,
+            "manifest": None,
+            "composed_interface": None,
+            "predicted_instance": None,
+            "direct_eval": None,
+            "subsystem_exact_match_eval": None,
+            "verify_eval": None,
+            "verify_skipped": False,
+            "status": "started",
+        }
+
         qvec = build_query_vectors(embed_model, [q], normalize=normalize)
         D, I = faiss_search(index, qvec, k=args.k)
         doc_id = int(I[0, 0])
@@ -797,6 +1051,9 @@ def main() -> None:
 
         if doc_id < 0:
             print("top1: <no result>")
+            record["status"] = "no_result"
+            append_jsonl(args.eval_out, record)
+            update_summary_counts(summary, record)
             print("-" * 130)
             continue
 
@@ -804,12 +1061,20 @@ def main() -> None:
         interface_obj_any = extract_interface_payload(meta)
         interface_obj = unwrap_interface(interface_obj_any)
 
+        record["top1"] = {
+            "faiss_id": doc_id,
+            "score": score,
+            "metric_label": label,
+            "interface_id_display": interface_id_display(interface_obj),
+            "interface_id": interface_obj.get("@id") if isinstance(interface_obj, dict) else None,
+            "displayName": interface_obj.get("displayName") if isinstance(interface_obj, dict) else None,
+        }
+
         print(f"top1: id={doc_id}  {label}={score:.6f}  ({interface_id_display(interface_obj)})")
         print("top1 interface (raw/wrapper possible):")
         print(pretty(interface_obj_any))
         print("")
 
-        # Determine whether composition is used
         use_decompose = (not args.no_decompose) and (metric == "ip") and (score < args.min_sim)
 
         used_path = "direct"
@@ -834,10 +1099,10 @@ def main() -> None:
                 print("[decomposition] got empty/invalid list; fallback to direct interface.")
                 used_path = "direct"
             else:
-                sub_queries = [str(x).strip() for x in decomp_obj if str(x).strip()][: args.max_subsystems]
+                sub_queries = [str(x).strip() for x in decomp_obj if str(x).strip()][:args.max_subsystems]
                 print(f"[decomposition] sub-queries (n={len(sub_queries)}):")
                 for i, sq in enumerate(sub_queries):
-                    print(f"  ({i+1}) {sq}")
+                    print(f"  ({i + 1}) {sq}")
                 print("")
 
                 subsystem_packs: List[Dict[str, Any]] = []
@@ -855,7 +1120,7 @@ def main() -> None:
                     subsystem_packs.append({"faiss_id": sid, "interface": siface_any, "score": sscore, "sub_query": sq})
 
                     print(
-                        f"  sub-query[{i+1}] -> faiss_id={sid}  {label}={sscore:.6f}  "
+                        f"  sub-query[{i + 1}] -> faiss_id={sid}  {label}={sscore:.6f}  "
                         f"({interface_id_display(siface)})"
                     )
                 print("")
@@ -867,6 +1132,9 @@ def main() -> None:
                     composed_id=composed_id,
                     composed_display=composed_display,
                 )
+                record["manifest"] = manifest
+                record["composed_interface"] = composed_iface
+
                 print("[composition] manifest:")
                 for m in manifest:
                     print(
@@ -878,22 +1146,35 @@ def main() -> None:
                 print(pretty(composed_iface))
                 print("")
 
-        # Stop early if fill-in disabled
+                subsystem_exact_match_eval = evaluate_subsystem_exact_match(
+                    desired_group_id=desired_group_id,
+                    manifest=manifest,
+                    dataset_original_group_map=dataset_original_group_map,
+                )
+                record["subsystem_exact_match_eval"] = subsystem_exact_match_eval
+                print("[evaluation] subsystem exact match vs desired interface group:")
+                print(pretty(subsystem_exact_match_eval))
+                print("")
+
+        record["path"] = used_path
+
         if args.no_fillin:
+            record["status"] = "fillin_disabled"
+            append_jsonl(args.eval_out, record)
+            update_summary_counts(summary, record)
             print(f"[info] fill-in disabled; path={used_path}")
             print("-" * 130)
             continue
 
-        # -------------------------
-        # Fill-in
-        # -------------------------
         if used_path == "direct":
             if not isinstance(interface_obj, dict):
                 print("[warn] direct interface is not a dict; skip fill-in/eval.")
+                record["status"] = "direct_interface_not_dict"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
-            # Direct fill-in: output flat instance matching expected_output schema
             fill_prompt = build_fillin_prompt_direct_flat_instance(description_text=q, interface_obj=interface_obj)
             print("[fill-in] path=direct")
             print("[fill-in] prompt:\n" + fill_prompt + "\n")
@@ -903,6 +1184,9 @@ def main() -> None:
                 inst_any = parse_model_json_output(model_text)
             except Exception as e:
                 print(f"[fill-in] ERROR: {e}")
+                record["status"] = f"direct_fillin_error: {e}"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
@@ -910,35 +1194,94 @@ def main() -> None:
                 print("[fill-in] ERROR: model output is not a JSON object/dict")
                 print("raw model output:")
                 print(model_text)
+                record["status"] = "direct_fillin_output_not_dict"
+                record["predicted_instance"] = model_text
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
             predicted_instance: Dict[str, Any] = inst_any
+            record["predicted_instance"] = predicted_instance
+
             print("initiated instance (model output):")
             print(pretty(predicted_instance))
             print("")
 
-            # -------------------------
-            # Evaluation (direct): strict compare vs expected_output
-            # -------------------------
             if not isinstance(exp, dict):
                 print("[warn] expected_output is not a dict; cannot strict-compare.")
+                record["status"] = "direct_expected_output_not_dict"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
-            eval_report = strict_compare_direct_instance(
+            raw_strict_eval = strict_compare_direct_instance(
                 predicted_instance=predicted_instance,
                 expected_output=exp,
                 interface_obj=interface_obj,
             )
-            print("evaluation (direct strict compare vs expected_output; ignore @id/displayName/dockerImage; ignore telemetries):")
-            print(pretty(eval_report))
+
+            print(
+                "evaluation (direct raw strict compare vs expected_output):")
+            print(pretty(raw_strict_eval))
+            print("")
+
+            direct_verify_prompt = build_verify_prompt_for_direct(
+                description_text=q,
+                interface_obj=interface_obj,
+                predicted_instance=predicted_instance,
+                expected_output=exp,
+            )
+            print("[verify-direct] prompt:\n" + direct_verify_prompt + "\n")
+
+            try:
+                direct_verify_text = ollama_generate(
+                    direct_verify_prompt,
+                    host=DEFAULT_HOST,
+                    model=DEFAULT_MODEL,
+                    timeout_s=args.timeout,
+                )
+                direct_verify_obj = parse_model_json_output(direct_verify_text)
+            except Exception as e:
+                print(f"[verify-direct] ERROR: {e}")
+                record["direct_eval"] = {
+                    "mode": "direct_llm_verify",
+                    "overall_ok": False,
+                    "final_source": "llm_verify",
+                    "raw_strict_compare": raw_strict_eval,
+                    "llm_verify_error": str(e),
+                }
+                record["status"] = f"direct_verify_error: {e}"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
+                print("-" * 130)
+                continue
+
+            final_direct_eval = build_direct_final_eval(
+                raw_strict_eval=raw_strict_eval,
+                llm_verify_obj=direct_verify_obj,
+            )
+
+            record["direct_eval"] = final_direct_eval
+            record["status"] = "ok"
+
+            print("verify result (direct LLM semantic verify):")
+            print(pretty(direct_verify_obj))
+            print("")
+            print("final evaluation (direct; final result based on LLM verify):")
+            print(pretty(final_direct_eval))
+
+            append_jsonl(args.eval_out, record)
+            update_summary_counts(summary, record)
             print("-" * 130)
 
         else:
-            # Composed fill-in: output nested instance to avoid conflicts
             if composed_iface is None or not isinstance(composed_iface, dict):
                 print("[warn] composed interface missing; cannot fill-in composed instance.")
+                record["status"] = "composed_interface_missing"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
@@ -951,6 +1294,9 @@ def main() -> None:
                 inst_any = parse_model_json_output(model_text)
             except Exception as e:
                 print(f"[fill-in] ERROR: {e}")
+                record["status"] = f"composed_fillin_error: {e}"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
@@ -958,19 +1304,26 @@ def main() -> None:
                 print("[fill-in] ERROR: model output is not a JSON object/dict")
                 print("raw model output:")
                 print(model_text)
+                record["status"] = "composed_fillin_output_not_dict"
+                record["predicted_instance"] = model_text
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
             composed_instance: Dict[str, Any] = inst_any
+            record["predicted_instance"] = composed_instance
+
             print("initiated instance (composed; model output):")
             print(pretty(composed_instance))
             print("")
 
-            # -------------------------
-            # Verification (composed): LLM verify reasonableness, no expected_output compare
-            # -------------------------
             if args.no_verify:
                 print("[verify] disabled (--no_verify).")
+                record["verify_skipped"] = True
+                record["status"] = "ok"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
@@ -982,17 +1335,32 @@ def main() -> None:
             print("[verify] prompt:\n" + verify_prompt + "\n")
 
             try:
-                # verify still uses ollama (unchanged)
                 verify_text = ollama_generate(verify_prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
                 verify_obj = parse_model_json_output(verify_text)
             except Exception as e:
                 print(f"[verify] ERROR: {e}")
+                record["status"] = f"verify_error: {e}"
+                append_jsonl(args.eval_out, record)
+                update_summary_counts(summary, record)
                 print("-" * 130)
                 continue
 
+            record["verify_eval"] = verify_obj
+            record["status"] = "ok"
+
             print("verify result (LLM):")
             print(pretty(verify_obj))
+            append_jsonl(args.eval_out, record)
+            update_summary_counts(summary, record)
             print("-" * 130)
+
+    write_json(summary_out, summary)
+
+    print("\n" + "=" * 130)
+    print("FINAL EVALUATION SUMMARY")
+    print(pretty(summary))
+    print(f"Per-query evaluation saved to: {args.eval_out}")
+    print(f"Summary saved to: {summary_out}")
 
 
 if __name__ == "__main__":
