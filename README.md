@@ -1,4 +1,4 @@
-# InterTwin: Digital Twin Data Pipeline
+# InterTwin: An Autonomous Framework for Interoperable Digital Twins Management and Composition
 
 This repo contains a practical end-to-end pipeline for **generating mass-scale DTDL v2 interfaces**, **creating “fill” evaluation data**, **fine-tuning models for extraction**, **running inference**, **evaluating results**, and **deploying an interactive agent UI**.
 
