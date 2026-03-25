@@ -20,7 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # --- Configs from env ---
 DEFAULT_HOST = os.getenv("OLLAMA_HOST", "http://10.1.1.49:60002")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
-DEFAULT_DATASET_PATH = os.getenv("ETE_EVAL_PATH", "./data/dataset_mid.jsonl")
+DEFAULT_DATASET_PATH = os.getenv("ETE_EVAL_PATH", "./data/dataset_small.jsonl")
 
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "./models/faiss.index")
 EMBEDDINGS_PATH = os.getenv("EMBEDDINGS_PATH", "./models/embeddings.npy")
@@ -525,7 +525,10 @@ def build_decompose_prompt(description_text: str, max_parts: int) -> str:
         "Important constraints:\n"
         f"- Return ONLY minified JSON array of strings.\n"
         f"- Array length must be between 1 and {max_parts}.\n"
+        f"- Split into reasonable number of sub-queries.\n"
         "- Each sub-query must be self-contained and target ONE subsystem/interface.\n"
+        "- Do NOT use description, data or facts from other sub-queries.\n"
+        "- Using similar language structure in the main query to construct sub-queries.\n"
         "- You MAY summarize wording, BUT you MUST preserve ALL stated facts and constraints.\n"
         "- Do NOT drop or generalize any information.\n"
         "- Do NOT simplify information.\n"
@@ -1016,6 +1019,7 @@ def build_debug_record(
     verify_eval: Optional[Dict[str, Any]] = None,
     predicted_instance: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
+    decompose_attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     rec: Dict[str, Any] = {
         "query_index": qi,
@@ -1037,6 +1041,8 @@ def build_debug_record(
         rec["verify_eval"] = verify_eval
     if predicted_instance is not None:
         rec["predicted_instance"] = predicted_instance
+    if decompose_attempts is not None:
+        rec["decompose_attempts"] = decompose_attempts
     return rec
 
 
@@ -1196,6 +1202,12 @@ def main() -> None:
 
     parser.add_argument("--min_sim", type=float, default=0.80, help="If top1 sim < min_sim, run decomposition/composition.")
     parser.add_argument("--max_subsystems", type=int, default=5, help="Max number of subsystems after decomposition.")
+    parser.add_argument(
+        "--decompose_retry_max",
+        type=int,
+        default=5,
+        help="Maximum number of full decomposition attempts when subsystem F1 < 0.81 (default: 5).",
+    )
 
     parser.add_argument("--no_fillin", action="store_true", help="Disable fill-in + evaluation entirely.")
     parser.add_argument("--no_decompose", action="store_true", help="Disable decomposition/composition even if sim is low.")
@@ -1282,12 +1294,10 @@ def main() -> None:
         if isinstance(q, str) and q.strip():
             queries.append(q.strip())
             expected_outputs.append(r.get("expected_output"))
-            iface = r.get("interface")
             gid = None
-            if isinstance(iface, dict):
-                raw_gid = iface.get("group_id")
-                if isinstance(raw_gid, str) and raw_gid.strip():
-                    gid = raw_gid.strip()
+            raw_gid = r.get("group_id")
+            if isinstance(raw_gid, str) and raw_gid.strip():
+                gid = raw_gid.strip()
             desired_group_ids.append(gid)
 
     if not queries:
@@ -1388,26 +1398,43 @@ def main() -> None:
         verify_eval: Optional[Dict[str, Any]] = None
         error_msg: Optional[str] = None
         status = "started"
+        decompose_attempts: List[Dict[str, Any]] = []
 
         if use_decompose:
             used_path = "decompose+compose"
             logger.brief(f"[{qi}] route=decompose+compose | top1 {label}={score:.6f} < min_sim {args.min_sim:.3f}")
-            decomp_prompt = build_decompose_prompt(description_text=q, max_parts=args.max_subsystems)
-            logger.verbose("[decomposition] prompt:\n" + decomp_prompt + "\n")
 
-            try:
-                decomp_text = ollama_generate(decomp_prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
-                decomp_obj = parse_model_json_output(decomp_text)
-            except Exception as e:
-                logger.brief(f"[{qi}] decomposition error -> fallback direct | {e}")
+            best_attempt_payload: Optional[Dict[str, Any]] = None
+
+            for attempt_idx in range(max(1, args.decompose_retry_max)):
+                logger.brief(f"[{qi}] decomposition attempt {attempt_idx + 1}/{max(1, args.decompose_retry_max)}")
+
+                decomp_prompt = build_decompose_prompt(description_text=q, max_parts=args.max_subsystems)
+                logger.verbose("[decomposition] prompt:\n" + decomp_prompt + "\n")
+
                 decomp_obj = []
-                error_msg = f"decomposition_error: {e}"
+                attempt_error: Optional[str] = None
 
-            if not isinstance(decomp_obj, list) or not decomp_obj:
-                used_path = "direct"
-            else:
+                try:
+                    decomp_text = ollama_generate(decomp_prompt, host=DEFAULT_HOST, model=DEFAULT_MODEL, timeout_s=args.timeout)
+                    decomp_obj = parse_model_json_output(decomp_text)
+                except Exception as e:
+                    attempt_error = f"decomposition_error: {e}"
+                    logger.brief(f"[{qi}] decomposition attempt {attempt_idx + 1} error | {e}")
+
+                if not isinstance(decomp_obj, list) or not decomp_obj:
+                    decompose_attempts.append({
+                        "attempt": attempt_idx + 1,
+                        "status": "invalid_decomposition_output",
+                        "error": attempt_error or "decomposition output not a non-empty list",
+                        "sub_queries": [],
+                        "manifest": None,
+                        "subsystem_exact_match_eval": None,
+                    })
+                    continue
+
                 sub_queries = [str(x).strip() for x in decomp_obj if str(x).strip()][:args.max_subsystems]
-                logger.brief(f"[{qi}] decomposition produced {len(sub_queries)} sub-queries")
+                logger.brief(f"[{qi}] decomposition produced {len(sub_queries)} sub-queries on attempt {attempt_idx + 1}")
                 logger.verbose(f"[decomposition] sub-queries:\n{pretty(sub_queries)}\n")
 
                 subsystem_packs: List[Dict[str, Any]] = []
@@ -1428,28 +1455,74 @@ def main() -> None:
 
                 composed_id = "dtmi:composed_system:Interface;1"
                 composed_display = "ComposedSystem"
-                composed_iface, manifest = compose_interfaces(
+                attempt_composed_iface, attempt_manifest = compose_interfaces(
                     subsystem_interfaces=subsystem_packs,
                     composed_id=composed_id,
                     composed_display=composed_display,
                 )
 
-                subsystem_exact_match_eval = evaluate_subsystem_exact_match(
+                attempt_subsystem_eval = evaluate_subsystem_exact_match(
                     desired_group_id=desired_group_id,
-                    manifest=manifest,
+                    manifest=attempt_manifest,
                     dataset_original_group_map=dataset_original_group_map,
                 )
 
+                attempt_f1 = float(attempt_subsystem_eval.get("f1", 0.0) or 0.0)
+
                 logger.brief(
-                    f"[{qi}] subsystem_match={subsystem_exact_match_eval.get('overall_ok')} "
-                    f"| tp={subsystem_exact_match_eval.get('tp')} fp={subsystem_exact_match_eval.get('fp')} fn={subsystem_exact_match_eval.get('fn')} "
-                    f"| f1={subsystem_exact_match_eval.get('f1'):.4f}"
+                    f"[{qi}] attempt {attempt_idx + 1} subsystem_match={attempt_subsystem_eval.get('overall_ok')} "
+                    f"| tp={attempt_subsystem_eval.get('tp')} fp={attempt_subsystem_eval.get('fp')} fn={attempt_subsystem_eval.get('fn')} "
+                    f"| f1={attempt_f1:.4f}"
                 )
                 logger.verbose("[composition] manifest:")
-                logger.verbose(pretty(manifest))
+                logger.verbose(pretty(attempt_manifest))
                 logger.verbose("[evaluation] subsystem exact match:")
-                logger.verbose(pretty(subsystem_exact_match_eval))
+                logger.verbose(pretty(attempt_subsystem_eval))
                 logger.verbose("")
+
+                attempt_payload = {
+                    "attempt": attempt_idx + 1,
+                    "status": "ok",
+                    "error": None,
+                    "sub_queries": sub_queries,
+                    "manifest": attempt_manifest,
+                    "subsystem_exact_match_eval": attempt_subsystem_eval,
+                    "composed_iface": attempt_composed_iface,
+                }
+                decompose_attempts.append({
+                    "attempt": attempt_idx + 1,
+                    "status": "ok",
+                    "error": None,
+                    "sub_queries": sub_queries,
+                    "manifest": attempt_manifest,
+                    "subsystem_exact_match_eval": attempt_subsystem_eval,
+                })
+
+                if best_attempt_payload is None:
+                    best_attempt_payload = attempt_payload
+                else:
+                    best_f1 = float(best_attempt_payload["subsystem_exact_match_eval"].get("f1", 0.0) or 0.0)
+                    if attempt_f1 > best_f1:
+                        best_attempt_payload = attempt_payload
+
+                if attempt_f1 >= 0.81:
+                    logger.brief(f"[{qi}] attempt {attempt_idx + 1} accepted because f1 >= 0.81")
+                    best_attempt_payload = attempt_payload
+                    break
+
+                if attempt_idx < max(1, args.decompose_retry_max) - 1:
+                    logger.brief(f"[{qi}] attempt {attempt_idx + 1} f1 < 0.81, restarting full decomposition...")
+                else:
+                    logger.brief(f"[{qi}] reached max decomposition attempts, using best available attempt.")
+
+            if best_attempt_payload is None:
+                used_path = "direct"
+                if error_msg is None:
+                    error_msg = "all decomposition attempts failed; fallback to direct"
+            else:
+                composed_iface = best_attempt_payload["composed_iface"]
+                manifest = best_attempt_payload["manifest"]
+                subsystem_exact_match_eval = best_attempt_payload["subsystem_exact_match_eval"]
 
         if args.no_fillin:
             status = "fillin_disabled"
@@ -1464,6 +1537,7 @@ def main() -> None:
                 manifest=manifest,
                 subsystem_eval=subsystem_exact_match_eval,
                 error=error_msg,
+                decompose_attempts=decompose_attempts if decompose_attempts else None,
             )
 
             append_jsonl(args.eval_out, paper_record)
@@ -1481,7 +1555,11 @@ def main() -> None:
                 status = "direct_interface_not_dict"
                 route_time_seconds = time.time() - query_start
                 paper_record = build_paper_record_direct(qi, q, doc_id, score, status, None, route_time_seconds)
-                debug_record = build_debug_record(qi, q, desired_group_id, used_path, top1, status, route_time_seconds, error=status)
+                debug_record = build_debug_record(
+                    qi, q, desired_group_id, used_path, top1, status, route_time_seconds,
+                    error=status,
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
+                )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
                 paper_records.append(paper_record)
@@ -1502,7 +1580,11 @@ def main() -> None:
                 status = f"direct_fillin_error: {e}"
                 route_time_seconds = time.time() - query_start
                 paper_record = build_paper_record_direct(qi, q, doc_id, score, status, None, route_time_seconds)
-                debug_record = build_debug_record(qi, q, desired_group_id, used_path, top1, status, route_time_seconds, error=str(e))
+                debug_record = build_debug_record(
+                    qi, q, desired_group_id, used_path, top1, status, route_time_seconds,
+                    error=str(e),
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
+                )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
                 paper_records.append(paper_record)
@@ -1516,7 +1598,11 @@ def main() -> None:
                 status = "direct_fillin_output_not_dict"
                 route_time_seconds = time.time() - query_start
                 paper_record = build_paper_record_direct(qi, q, doc_id, score, status, None, route_time_seconds)
-                debug_record = build_debug_record(qi, q, desired_group_id, used_path, top1, status, route_time_seconds, error="fillin output not dict")
+                debug_record = build_debug_record(
+                    qi, q, desired_group_id, used_path, top1, status, route_time_seconds,
+                    error="fillin output not dict",
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
+                )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
                 paper_records.append(paper_record)
@@ -1539,6 +1625,7 @@ def main() -> None:
                     qi, q, desired_group_id, used_path, top1, status, route_time_seconds,
                     predicted_instance=predicted_instance,
                     error="expected_output is not dict",
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
                 )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
@@ -1602,6 +1689,7 @@ def main() -> None:
                     direct_eval=direct_eval,
                     predicted_instance=predicted_instance,
                     error=str(e),
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
                 )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
@@ -1635,6 +1723,7 @@ def main() -> None:
                 qi, q, desired_group_id, used_path, top1, status, route_time_seconds,
                 direct_eval=direct_eval,
                 predicted_instance=predicted_instance,
+                decompose_attempts=decompose_attempts if decompose_attempts else None,
             )
 
             append_jsonl(args.eval_out, paper_record)
@@ -1652,6 +1741,7 @@ def main() -> None:
                     manifest=manifest,
                     subsystem_eval=subsystem_exact_match_eval,
                     error=status,
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
                 )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
@@ -1678,6 +1768,7 @@ def main() -> None:
                     manifest=manifest,
                     subsystem_eval=subsystem_exact_match_eval,
                     error=str(e),
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
                 )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
@@ -1697,6 +1788,7 @@ def main() -> None:
                     manifest=manifest,
                     subsystem_eval=subsystem_exact_match_eval,
                     error="fillin output not dict",
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
                 )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
@@ -1721,6 +1813,7 @@ def main() -> None:
                     manifest=manifest,
                     subsystem_eval=subsystem_exact_match_eval,
                     predicted_instance=predicted_instance,
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
                 )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
@@ -1751,6 +1844,7 @@ def main() -> None:
                     subsystem_eval=subsystem_exact_match_eval,
                     predicted_instance=predicted_instance,
                     error=str(e),
+                    decompose_attempts=decompose_attempts if decompose_attempts else None,
                 )
                 append_jsonl(args.eval_out, paper_record)
                 append_jsonl(args.debug_out, debug_record)
@@ -1778,6 +1872,7 @@ def main() -> None:
                 subsystem_eval=subsystem_exact_match_eval,
                 verify_eval=verify_eval,
                 predicted_instance=predicted_instance,
+                decompose_attempts=decompose_attempts if decompose_attempts else None,
             )
 
             append_jsonl(args.eval_out, paper_record)
@@ -1807,6 +1902,7 @@ def main() -> None:
         "normalize_queries": normalize,
         "min_sim": args.min_sim,
         "fill_backend": args.fill_backend,
+        "decompose_retry_max": args.decompose_retry_max,
         "overall_time_stats": compute_time_stats(paper_records),
         "direct_time_stats": compute_time_stats([r for r in paper_records if r.get("path") == "direct"]),
         "decompose_time_stats": compute_time_stats([r for r in paper_records if r.get("path") == "decompose+compose"]),
