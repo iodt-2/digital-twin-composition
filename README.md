@@ -1,6 +1,6 @@
 # InterTwin: An Autonomous Framework for Interoperable Digital Twins Management and Composition
 
-This repo contains a practical end-to-end pipeline for **generating mass-scale DTDL v2 interfaces**, **creating “fill” evaluation data**, **fine-tuning models for extraction**, **running inference**, **evaluating results**, and **deploying an interactive agent UI**.
+This repo contains a practical end-to-end pipeline for **generating mass-scale DTDL v2 interfaces**, **creating “fill” evaluation data**, **fine-tuning models for extraction**, **running inference**, **evaluating results**, **running system-level evaluation**, and **deploying an interactive agent UI**.
 
 At a high level:
 
@@ -9,8 +9,9 @@ At a high level:
 3. **Train**:
    - a SentenceTransformer for semantic retrieval (triplet training), or
    - a small LLM via GRPO for structured JSON extraction.
-4. **Run inference** to fill properties from anchors and **evaluate** predictions.
-5. **Deploy** an interactive agent UI (CLI or Flask UI).
+4. **Run inference** to fill properties from anchors (local Transformers or Gemini/OpenAI-compatible API).
+5. **Evaluate** model outputs and full-system behavior.
+6. **Deploy** an interactive Flask-based agent UI.
 
 ---
 
@@ -32,12 +33,15 @@ The scripts are grouped by stage (prefix numbers reflect the pipeline order):
 
 ### 2) Performance evaluation
 - `2.perf-eval-fill-gen-local.py` — Runs **local Transformers** extraction to fill properties from anchors; supports resume with `.done` indices and writes progress stats.
+- `2.perf-eval-fill-gen-gemini.py` — Runs extraction through a Gemini/OpenAI-compatible chat-completions endpoint; supports resume and writes progress/time stats.
 - `2.perf-eval-result-eval.py` — Compares filled outputs against `fill-eval.jsonl` answers and reports precision/recall/F1/EM and time stats; can auto-discover predictions under `finished/`.
 - `2.perf-eval-sentence-transformer.py` — Benchmarks multiple embedding models on the triplet test set.
 
-### 3) Deployment / demos
-- `3.deploy-adt.py` — A CLI “agentic” loop that talks to Ollama, executes generated Python blocks locally, and iterates steps until “Finished”.
-- `3.deploy-agi-flask.py` — A Flask web UI version of the agent loop with SSE streaming, step cards, and in-browser rendering.
+### 3) System-level evaluation
+- `3.system-eval.py` — End-to-end retrieval/decomposition/composition/fill-in evaluation pipeline with FAISS + SentenceTransformer + local Qwen/Ollama steps.
+
+### 4) Deployment / demos
+- `4.deploy-agi-flask.py` — A Flask web UI agent loop with SSE streaming, step cards, and in-browser rendering.
 
 ---
 
@@ -50,6 +54,7 @@ Common artifacts you’ll see:
 - `interfaces_done.txt` — topic ids that have been processed for interfaces.
 - `fill-eval.jsonl` — one record per interface line: `{ "anchor": "...", "answer": {...} }`, plus a `.ckpt` file for resume.
 - `triplet_database.jsonl` — triplets for retrieval training: `{query, positive, negative}`.
+- Trained/released models under `models/` (for example: `models/MiniLM-L6-based-new-triplets-final/` and `models/Qwen2-0.5B-GRPO-Fill-In/`).
 - Filled inference outputs (per model folder), e.g.:
   - `checkpoint-5500/filled-output-checkpoint-5500.jsonl`
   - along with `.done`, `progress-*.json`, and `sample_time_stats-*.txt`
@@ -68,6 +73,21 @@ Several scripts call an Ollama-compatible server:
 - Deploy scripts also talk to Ollama (`/api/chat`)
 
 If your Ollama server differs, pass `--host/--model` (where supported) or set environment variables where supported.
+
+---
+
+## Pretrained model downloads
+
+If you prefer evaluation/inference without re-training, download these released checkpoints:
+
+### Sentence Transformers
+- `st-dt-MiniLM-L6` (v1.1): https://github.com/iodt-2/digital-twin-composition/releases/download/v1.1/st-dt-MiniLM-L6.zip
+- `st-dt-deberta` (v1.0): https://github.com/iodt-2/digital-twin-composition/releases/download/v1.0/st-dt-deberta.zip
+
+### LLM for fill-in
+- `Qwen2-0.5B-GRPO-Fill-In` (v1.0): https://github.com/iodt-2/digital-twin-composition/releases/download/v1.0/Qwen2-0.5B-GRPO-Fill-In.zip
+
+Suggested extraction target: `models/`.
 
 ---
 
@@ -134,6 +154,8 @@ python 1.fine-tune-sentence-transformer.py
 
 This trains using a triplet-style objective (MultipleNegativesRankingLoss by default), logs to Weights & Biases, and saves models under `models/...`.
 
+Or use a released checkpoint from the links in **Pretrained model downloads**.
+
 (Optional) benchmark multiple embedding models:
 
 ```bash
@@ -152,6 +174,8 @@ python 1.fine-tune-GRPO-llm.py
 
 This uses TRL’s `GRPOTrainer` and saves to `Qwen2-0.5B-GRPO/`.
 
+Or use the released fill-in model from **Pretrained model downloads**.
+
 ---
 
 ### Step 4 — Run local extraction inference (fill properties)
@@ -166,6 +190,14 @@ python 2.perf-eval-fill-gen-local.py
 ```
 
 Outputs are written under a folder named after your model path tail (e.g. `checkpoint-5500/`), with resume support via a `.done` file and progress stats.
+
+To run hosted inference through a Gemini/OpenAI-compatible endpoint:
+
+```bash
+python 2.perf-eval-fill-gen-gemini.py
+```
+
+Set `OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL`, `OPENAI_MODEL`) before running.
 
 ---
 
@@ -185,15 +217,17 @@ If you omit `--pred`, it can scan `finished/` for `*.jsonl` outputs automaticall
 
 ---
 
-## Deployment demos
-
-### CLI agent demo
-
-Runs an iterative agent loop: streams Ollama responses, executes any generated python code blocks, and continues until it sees `Finished`.
+### Step 6 — Run end-to-end system evaluation
 
 ```bash
-python 3.deploy-adt.py
+python 3.system-eval.py --k 1 --normalize
 ```
+
+`3.system-eval.py` supports additional controls (for example decomposition thresholds, model paths, and output files) via CLI flags.
+
+---
+
+## Deployment demos
 
 ### Flask UI agent demo
 
@@ -202,7 +236,7 @@ Starts a local web UI with step-by-step streaming (SSE), allowing you to enter a
 ```bash
 export OLLAMA_HOST="http://YOUR_OLLAMA_HOST:PORT"
 export OLLAMA_MODEL="YOUR_MODEL"
-python 3.deploy-agi-flask.py
+python 4.deploy-agi-flask.py
 # then open http://127.0.0.1:5000
 ```
 
