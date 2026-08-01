@@ -20,6 +20,12 @@ there is no package entry point, no test suite, no CI.
 dependencies/            shared modules imported as `dependencies.<name>`
 ```
 
+Two instance shapes come out of the pipeline, and anything consuming an instance has to
+handle both: the direct route's flat `{"interface", "<property>": ...}` (also the shape
+of `answer` in `fill-eval.jsonl`), and the composed route's
+`{"interface", "subsystems": {"<name>": {...}}}`. `4.to-docker-compose.py` is the
+worked example.
+
 ## The data contract
 
 Four invariants hold the pipeline together. Most bugs here are violations of one of them.

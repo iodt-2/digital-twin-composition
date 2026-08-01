@@ -60,6 +60,8 @@ Scripts are prefixed by pipeline stage. Everything is run from the repository ro
 
 ### 4) Deployment
 - `4.deploy-agi-flask.py` — Flask agent loop with SSE streaming and per-step cards.
+- `4.to-docker-compose.py` — turns an instantiated instance into a `docker-compose.yaml`,
+  one service per interface. Dependency-free.
 
 ### Shared code
 - `dependencies/fill_eval_runner.py` — the loop both fill-in backends share (schema
@@ -262,7 +264,30 @@ id, and that file is what maps ids back to topics.
 
 ---
 
-## Deployment demo
+## Deployment
+
+### From instance to running containers
+
+The pipeline ends with an instantiated interface; `4.to-docker-compose.py` turns that
+into something you can `docker compose up`:
+
+```bash
+python 4.to-docker-compose.py data/fill-eval.jsonl --line 1 -o docker-compose.yaml
+python 4.to-docker-compose.py instance.json          # or read stdout
+```
+
+It accepts both instance shapes — the flat one from the direct route, and the
+`{"subsystems": {...}}` one from the composed route, which yields one service per
+subsystem. Per service: `dockerImage` becomes the image, the remaining properties become
+`UPPER_SNAKE_CASE` environment variables, and the interface id is kept as a
+`dtdl.interface` label. Null properties are dropped, since nothing in the source text
+stated them.
+
+Note the generated images are the placeholder `registry.local/dtm/...` paths the
+generator assigns — the file is a deployment *manifest* for a synthesised twin, not a
+reference to images that exist.
+
+### Agent UI demo
 
 ```bash
 export OLLAMA_HOST="http://YOUR_OLLAMA_HOST:PORT"
