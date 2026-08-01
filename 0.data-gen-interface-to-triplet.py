@@ -28,15 +28,15 @@ import requests
 # Defaults
 # ---------------------------
 
-DEFAULT_OLLAMA_HOST = "http://10.10.10.4:11434"
+DEFAULT_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://10.10.10.4:11434")
 # gpt-oss:20b is the verifier: ~1.9x faster per call than gpt-oss:120b (median 1.39s vs 2.59s)
 # and it agrees with 120b on 15/20 near-duplicate topic pairs, vs 12/20 for gemma3:27b and
 # llama3.2:3b. The lexical prefilter below covers most of the remaining gap.
-DEFAULT_MODEL = "gpt-oss:20b"
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 
 INTERFACES_JSONL = os.path.join("data", "interfaces.jsonl")
 FILL_EVAL_JSONL = os.path.join("data", "fill-eval.jsonl")
-OUTPUT_JSONL = "data/triplet_database.jsonl"
+OUTPUT_JSONL = os.path.join("data", "triplet.jsonl")
 
 
 # ---------------------------

@@ -1,40 +1,79 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Benchmark embedding models on the held-out triplet test split.
+
+    python 2.perf-eval-sentence-transformer.py
+    python 2.perf-eval-sentence-transformer.py --models all-MiniLM-L6-v2 ./models/my-run-final
+
+The split is re-derived from `data/triplet.jsonl` with the same seed
+`1.fine-tune-sentence-transformer.py` uses, so the test set here is the 10% that
+training never saw and never evaluated on.
+"""
+
+import argparse
+import os
+import sys
 import time
 
 from datasets import load_dataset
-from sentence_transformers.evaluation import SimilarityFunction
-from SuperTripletEvaluator import SuperTripletEvaluator
-
-
-datafile = "triplet_database.jsonl"
-
-dataset = load_dataset("json", data_files=datafile)
-full_dataset = dataset["train"]
-train_testvalid = full_dataset.train_test_split(test_size=0.2, seed=42)
-test_valid_split = train_testvalid["test"].train_test_split(test_size=0.5, seed=42)
-train_dataset = train_testvalid["train"]
-eval_dataset = train_testvalid["test"]
-test_dataset = test_valid_split["test"]
-
 from sentence_transformers import SentenceTransformer
+from sentence_transformers.evaluation import SimilarityFunction
 
-models = ["./deberta-base", 'all-MiniLM-L6-v2', 'all-MiniLM-L12-v2', 'all-mpnet-base-v2',
-          'multi-qa-mpnet-base-dot-v1', 'all-distilroberta-v1', 'multi-qa-distilbert-cos-v1',
-          'multi-qa-MiniLM-L6-cos-v1',
-          './models/base/dt-triplet-v3-deberta-all-final', './models/base/dt-triplet-v3-MiniLM-L6-all-final']
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dependencies.SuperTripletEvaluator import SuperTripletEvaluator  # noqa: E402
 
-evaluator = SuperTripletEvaluator(
+DEFAULT_DATAFILE = os.path.join("data", "triplet.jsonl")
+DEFAULT_MODELS = [
+    "all-MiniLM-L6-v2",
+    "all-MiniLM-L12-v2",
+    "all-mpnet-base-v2",
+    "multi-qa-mpnet-base-dot-v1",
+    "all-distilroberta-v1",
+    "multi-qa-distilbert-cos-v1",
+    "multi-qa-MiniLM-L6-cos-v1",
+    "./models/MiniLM-L6-based-new-triplets-final",
+]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", default=DEFAULT_DATAFILE, help=f"Triplet JSONL (default: {DEFAULT_DATAFILE})")
+    ap.add_argument("--models", nargs="*", default=DEFAULT_MODELS, help="Model names or local paths")
+    ap.add_argument("--limit", type=int, default=0, help="Evaluate on the first N test triplets (0 = all)")
+    ap.add_argument("--seed", type=int, default=42, help="Split seed; must match the training script")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.data):
+        raise SystemExit(f"[ERROR] Triplet file not found: {args.data}")
+
+    full_dataset = load_dataset("json", data_files=args.data)["train"]
+    train_testvalid = full_dataset.train_test_split(test_size=0.2, seed=args.seed)
+    test_dataset = train_testvalid["test"].train_test_split(test_size=0.5, seed=args.seed)["test"]
+    if args.limit:
+        test_dataset = test_dataset.select(range(min(args.limit, len(test_dataset))))
+    print(f"[INFO] Evaluating on {len(test_dataset)} held-out triplets\n")
+
+    evaluator = SuperTripletEvaluator(
         anchors=test_dataset["query"],
         positives=test_dataset["positive"],
         negatives=test_dataset["negative"],
-        main_distance_function=SimilarityFunction.COSINE,
-        name="triplet-dev",
+        main_similarity_function=SimilarityFunction.COSINE,
+        name="triplet-test",
     )
 
-for m in models:
-    model = SentenceTransformer(m)
-    start_time = time.time()
-    results = evaluator(model)
-    end_time = time.time()
-    results['time_taken'] = end_time - start_time
-    print(f"{m}: {results}")
+    for name in args.models:
+        try:
+            model = SentenceTransformer(name)
+        except Exception as e:  # noqa: BLE001 - a missing local checkpoint should not end the sweep
+            print(f"[WARN] {name}: could not load ({e})")
+            continue
+        start = time.time()
+        results = evaluator(model)
+        results["time_taken_seconds"] = time.time() - start
+        print(f"{name}: {results}")
 
+
+if __name__ == "__main__":
+    main()

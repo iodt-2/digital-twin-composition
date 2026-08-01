@@ -1,3 +1,26 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Flask demo of the agent loop: query in, step-by-step reasoning and execution out (SSE).
+
+    export OLLAMA_HOST="http://YOUR_HOST:PORT"
+    export OLLAMA_MODEL="gpt-oss:120b"
+    python 4.deploy-agi-flask.py            # http://127.0.0.1:5000
+
+SECURITY
+--------
+Each step's ```python block is passed straight to `exec()` in this process. That is the
+point of the demo — the model searches FAISS and composes interfaces by writing code —
+but it means whoever can reach this port can run arbitrary code as the user running it,
+and so can any model output that a prompt manages to steer. There is no sandbox.
+
+Consequences:
+  * It binds 127.0.0.1 and refuses to bind anything else unless you set ALLOW_REMOTE=1.
+  * Point it at a model and a host you control.
+  * Set ALLOW_CODE_EXEC=0 to run the loop with execution disabled; steps then show the
+    assistant text only, which is enough to inspect the reasoning.
+"""
+
 import contextlib
 import io
 import json
@@ -18,7 +41,23 @@ from flask import Flask, Response, jsonify, render_template_string, request
 DEFAULT_HOST = os.getenv("OLLAMA_HOST", "http://10.1.1.49:60002")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
 
-# Original prompt idea preserved from your script, but now the user's query is injected dynamically. :contentReference[oaicite:1]{index=1}
+# The loop ends when the model says "Finished". Nothing guarantees it ever does, so cap
+# the number of steps rather than letting a run bill tokens until the process is killed.
+MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
+ALLOW_CODE_EXEC = os.getenv("ALLOW_CODE_EXEC", "1") not in ("0", "false", "False")
+ALLOW_REMOTE = os.getenv("ALLOW_REMOTE", "0") not in ("0", "false", "False")
+DEBUG = os.getenv("FLASK_DEBUG", "0") not in ("0", "false", "False")
+# Completed runs are kept so a reconnecting browser can still read the last events.
+MAX_RETAINED_RUNS = 20
+
+# Retrieval artifacts the agent is told to use. These are the files 3.build-faiss-index.py
+# writes, so the paths in the prompt and the paths on disk cannot drift apart.
+FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "models/faiss.index")
+EMBEDDINGS_PATH = os.getenv("EMBEDDINGS_PATH", "models/embeddings.npy")
+METADATA_PATH = os.getenv("METADATA_PATH", "models/metadata.json")
+SENTENCE_TRANSFORMER_PATH = os.getenv("SENTENCE_TRANSFORMER_PATH",
+                                      "models/MiniLM-L6-based-new-triplets-final")
+
 INITIAL_PROMPT_TEMPLATE = """
 You are an agentic AI system designed to generate a specific Digital Twin instance from the interface in the repository. General
 requirement for the system:
@@ -33,13 +72,13 @@ requirement for the system:
   - Execute only one action each step, do not combine multiple actions
   - Important: attach the corresponding action description for the next action at the end of prompt.
   - FAISS configs
-    - FAISS_INDEX_PATH = "dt_faiss.index"
-    - EMBEDDINGS_PATH = "dt_embeddings.npy"
-    - METADATA_PATH = "dt_metadata.json"
+    - FAISS_INDEX_PATH = "{faiss_index_path}"
+    - EMBEDDINGS_PATH = "{embeddings_path}"
+    - METADATA_PATH = "{metadata_path}"
 
 Available actions and action descriptions:
 1 Search
-  - Use Sentence Transformer at `./MiniLM-L6-fine-tuned`
+  - Use Sentence Transformer at `{sentence_transformer_path}`
   - Search in the FAISS
   - Results must match domain semantics and with high similarity
   - Indicate clearly if the results match the query based on your knowledge instead of hard matching (e.g., key word search)
@@ -75,15 +114,18 @@ User's query: {user_query}
 # Utilities
 # ----------------------------
 def execute_python(code: str) -> str:
+    """Run a model-authored code block in this process and capture its stdout.
+
+    Unsandboxed by design — see the module docstring. `ALLOW_CODE_EXEC=0` turns it off.
     """
-    Execute dynamically generated Python code and capture printed output.
-    Matches your original approach. :contentReference[oaicite:2]{index=2}
-    """
+    if not ALLOW_CODE_EXEC:
+        return "[Code execution disabled: ALLOW_CODE_EXEC=0]\n\n" + code
+
     buffer = io.StringIO()
-    local_vars = {}
+    local_vars: Dict[str, object] = {}
     try:
         with contextlib.redirect_stdout(buffer):
-            exec(code, local_vars)
+            exec(code, local_vars)  # noqa: S102 - the demo's whole purpose
     except Exception as e:
         return f"[Error executing code] {e}"
 
@@ -93,6 +135,12 @@ def execute_python(code: str) -> str:
         combined = f"{printed_output}\n[result] {result}".strip()
         return combined if combined else "[No output]"
     return printed_output or "[No output]"
+
+
+def is_finished(text: str) -> bool:
+    """True when the step is the agent's terminal 'Finished' signal."""
+    cleaned = (text or "").strip().strip("*_`# ").rstrip(".!").strip()
+    return cleaned.lower() == "finished"
 
 
 def extract_python_block(text: str) -> Optional[str]:
@@ -105,11 +153,9 @@ def extract_python_block(text: str) -> Optional[str]:
 
 
 def ollama_chat_stream(messages: List[dict], host: str, model: str):
-    """
-    Stream tokens from Ollama /api/chat. Similar to your query_ollama_chat but yields chunks. :contentReference[oaicite:3]{index=3}
-    """
+    """Stream assistant tokens from Ollama `/api/chat`, one content chunk at a time."""
     payload = {"model": model, "messages": messages, "stream": True}
-    with requests.post(f"{host}/api/chat", json=payload, stream=True, timeout=600) as r:
+    with requests.post(f"{host.rstrip('/')}/api/chat", json=payload, stream=True, timeout=600) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line:
@@ -625,7 +671,13 @@ document.getElementById("stopBtn").addEventListener("click", stopRun);
 # ----------------------------
 def run_agent(state: RunState):
     try:
-        system_prompt = INITIAL_PROMPT_TEMPLATE.format(user_query=state.user_query)
+        system_prompt = INITIAL_PROMPT_TEMPLATE.format(
+            user_query=state.user_query,
+            faiss_index_path=FAISS_INDEX_PATH,
+            embeddings_path=EMBEDDINGS_PATH,
+            metadata_path=METADATA_PATH,
+            sentence_transformer_path=SENTENCE_TRANSFORMER_PATH,
+        )
 
         state.messages = [
             {"role": "system", "content": system_prompt},
@@ -633,7 +685,7 @@ def run_agent(state: RunState):
         ]
 
         step = 0
-        while not state.stop_flag:
+        while not state.stop_flag and step < MAX_STEPS:
             rec = StepRecord(step=step, status="running")
             state.steps.append(rec)
             state.event_q.put({"type": "step_status", "step": step, "status": "running"})
@@ -655,8 +707,9 @@ def run_agent(state: RunState):
                 state.event_q.put({"type": "step_status", "step": step, "status": "stopped"})
                 break
 
-            # Finished?
-            if rec.assistant_text == "Finished":
+            # Finished? The prompt asks for the bare word, but models routinely add a
+            # full stop, bold it, or wrap it in a sentence-ending flourish.
+            if is_finished(rec.assistant_text):
                 rec.status = "finished"
                 rec.exec_output = "✅ Finished"
                 state.event_q.put({"type": "exec_output", "step": step, "output": rec.exec_output})
@@ -681,6 +734,14 @@ def run_agent(state: RunState):
                 {"role": "user", "content": f"Step {step} output:\n{rec.exec_output}\nNext step?"}
             )
             step += 1
+
+        if step >= MAX_STEPS and not state.stop_flag:
+            state.event_q.put({"type": "step_status", "step": step - 1, "status": "step limit"})
+            state.event_q.put({
+                "type": "exec_output",
+                "step": step - 1,
+                "output": f"[Stopped after MAX_STEPS={MAX_STEPS} without a 'Finished' step]",
+            })
 
     except Exception as e:
         state.error = str(e)
@@ -712,6 +773,11 @@ def start():
 
     with RUNS_LOCK:
         RUNS[run_id] = state
+        # Bound the run table: a long-lived process would otherwise retain every
+        # transcript and its queued events for the lifetime of the server.
+        while len(RUNS) > MAX_RETAINED_RUNS:
+            oldest = min(RUNS.values(), key=lambda s: s.created_at)
+            RUNS.pop(oldest.run_id, None)
 
     t = threading.Thread(target=run_agent, args=(state,), daemon=True)
     t.start()
@@ -769,6 +835,13 @@ def events(run_id):
 
 
 if __name__ == "__main__":
-    # Run locally: http://127.0.0.1:5000
-    # If exposing on a LAN, consider using host="0.0.0.0"
-    app.run(host="127.0.0.1", port=5000, debug=True, threaded=True)
+    bind = "0.0.0.0" if ALLOW_REMOTE else "127.0.0.1"
+    port = int(os.getenv("PORT", "5000"))
+    print(f"Ollama: {DEFAULT_MODEL} @ {DEFAULT_HOST}")
+    print(f"Code execution: {'ENABLED (unsandboxed exec)' if ALLOW_CODE_EXEC else 'disabled'}")
+    if ALLOW_REMOTE:
+        print("[WARN] ALLOW_REMOTE=1: binding 0.0.0.0. Anyone who can reach this port can "
+              "run code on this machine.")
+    print(f"Open http://{'<this-host>' if ALLOW_REMOTE else '127.0.0.1'}:{port}")
+    # debug=True also enables the Werkzeug debugger console; keep it opt-in.
+    app.run(host=bind, port=port, debug=DEBUG, threaded=True)

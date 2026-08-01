@@ -1,12 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+End-to-end evaluation of the retrieve -> decompose -> compose -> fill-in pipeline.
+
+    python 3.build-faiss-index.py            # prerequisite, builds the index + metadata
+    python 3.system-eval.py --k 1 --normalize
+
+For each query the top-1 FAISS hit is either good enough (>= --min_sim) and the query is
+filled directly against that interface, or it is not, and the query is decomposed into
+sub-queries, each retrieved separately, and the results composed into one interface
+before fill-in. Both routes end in an LLM verification pass and are scored separately,
+because they answer different questions: "did we find the right twin?" versus "did we
+assemble one?".
+
+Prerequisites (env-overridable, all built by 3.build-faiss-index.py):
+    FAISS_INDEX_PATH, EMBEDDINGS_PATH, METADATA_PATH, DATASET_ORIGINAL_PATH
+    SENTENCE_TRANSFORMER_PATH   the fine-tuned retrieval model
+    OLLAMA_HOST / OLLAMA_MODEL  the decomposition and verification model
+"""
+
 import os
 import re
 import json
 import ast
 import time
-import math
 import argparse
 from typing import Any, Dict, List, Tuple, Optional, Set
 import numpy as np
@@ -158,8 +176,16 @@ def extract_group_id_from_dtmi(dtmi: str) -> str:
 
 
 def load_dataset_original_group_index(path: str) -> Dict[str, Dict[str, Any]]:
+    """topic id -> the FAISS ids that belong to it.
+
+    Line number - 1 is taken as the FAISS id, so this file must be the exact list the
+    index was built from, in the same order. `3.build-faiss-index.py` writes both.
+    """
     if not os.path.exists(path):
-        raise FileNotFoundError(f"DATASET_ORIGINAL_PATH not found: {path}")
+        raise FileNotFoundError(
+            f"DATASET_ORIGINAL_PATH not found: {path}\n"
+            f"Build it together with the index: python 3.build-faiss-index.py"
+        )
 
     rows = load_jsonl(path)
     group_map: Dict[str, Dict[str, Any]] = {}
@@ -458,7 +484,7 @@ def qwen_generate(
         mdl = AutoModelForCausalLM.from_pretrained(
             model_path,
             trust_remote_code=True,
-            torch_dtype=(torch.float16 if torch.cuda.is_available() else torch.float32),
+            dtype=(torch.float16 if torch.cuda.is_available() else torch.float32),
             device_map="auto",
         )
         _QWEN_CACHE[key] = (tok, mdl)
@@ -1206,7 +1232,24 @@ def main() -> None:
         "--decompose_retry_max",
         type=int,
         default=5,
-        help="Maximum number of full decomposition attempts when subsystem F1 < 0.81 (default: 5).",
+        help="Maximum number of full decomposition attempts (default: 5).",
+    )
+    parser.add_argument(
+        "--retry_selection",
+        choices=["oracle", "first"],
+        default="oracle",
+        help="How to pick among decomposition attempts. 'oracle' retries until the "
+             "subsystem F1 against the ground-truth topic clears --retry_f1_target and "
+             "keeps the best-scoring attempt -- the labels steer the system, so the "
+             "resulting numbers are an upper bound, not a blind-run score. 'first' keeps "
+             "the first attempt that produces subsystems and never looks at the labels. "
+             "Default is 'oracle' for continuity with the published runs.",
+    )
+    parser.add_argument(
+        "--retry_f1_target",
+        type=float,
+        default=0.81,
+        help="Subsystem F1 at which the oracle retry loop stops early (default: 0.81).",
     )
 
     parser.add_argument("--no_fillin", action="store_true", help="Disable fill-in + evaluation entirely.")
@@ -1250,7 +1293,10 @@ def main() -> None:
         pass
 
     if not os.path.exists(FAISS_INDEX_PATH):
-        raise FileNotFoundError(f"FAISS_INDEX_PATH not found: {FAISS_INDEX_PATH}")
+        raise FileNotFoundError(
+            f"FAISS_INDEX_PATH not found: {FAISS_INDEX_PATH}\n"
+            f"Build it first: python 3.build-faiss-index.py"
+        )
     index = faiss.read_index(FAISS_INDEX_PATH)
 
     if os.path.exists(EMBEDDINGS_PATH):
@@ -1304,7 +1350,12 @@ def main() -> None:
         raise ValueError("No valid 'query' strings found in dataset slice.")
 
     if not os.path.exists(SENTENCE_TRANSFORMER_PATH):
-        raise FileNotFoundError(f"SENTENCE_TRANSFORMER_PATH not found: {SENTENCE_TRANSFORMER_PATH}")
+        raise FileNotFoundError(
+            f"SENTENCE_TRANSFORMER_PATH not found: {SENTENCE_TRANSFORMER_PATH}\n"
+            "Train one with 1.fine-tune-sentence-transformer.py, or download a released "
+            "checkpoint (see the README) and extract it there. It must be the same model "
+            "3.build-faiss-index.py encoded the index with."
+        )
     embed_model = SentenceTransformer(SENTENCE_TRANSFORMER_PATH)
 
     def fillin_generate(prompt: str) -> str:
@@ -1328,6 +1379,13 @@ def main() -> None:
     logger.section(f"Summary out: {summary_out}")
     logger.section(f"Debug summary out: {debug_summary_out}")
     logger.section(f"Index: {FAISS_INDEX_PATH}   metric={metric}   normalize_queries={normalize}")
+    logger.section(f"Decomposition retries: {args.decompose_retry_max}   selection={args.retry_selection}")
+    if args.retry_selection == "oracle" and not args.no_decompose:
+        logger.section(
+            "[WARN] retry_selection=oracle scores every decomposition attempt against the "
+            "ground-truth topic and keeps the best. Composed-route numbers are an upper "
+            "bound under this setting; use --retry_selection first for a blind run."
+        )
     logger.section("=" * 130)
 
     paper_records: List[Dict[str, Any]] = []
@@ -1498,6 +1556,13 @@ def main() -> None:
                     "subsystem_exact_match_eval": attempt_subsystem_eval,
                 })
 
+                # 'first' never consults attempt_f1, so the labels play no part in what the
+                # system returns; 'oracle' selects on it and is therefore an upper bound.
+                if args.retry_selection == "first":
+                    best_attempt_payload = attempt_payload
+                    logger.brief(f"[{qi}] attempt {attempt_idx + 1} accepted (retry_selection=first)")
+                    break
+
                 if best_attempt_payload is None:
                     best_attempt_payload = attempt_payload
                 else:
@@ -1505,13 +1570,15 @@ def main() -> None:
                     if attempt_f1 > best_f1:
                         best_attempt_payload = attempt_payload
 
-                if attempt_f1 >= 0.81:
-                    logger.brief(f"[{qi}] attempt {attempt_idx + 1} accepted because f1 >= 0.81")
+                if attempt_f1 >= args.retry_f1_target:
+                    logger.brief(f"[{qi}] attempt {attempt_idx + 1} accepted because "
+                                 f"f1 >= {args.retry_f1_target}")
                     best_attempt_payload = attempt_payload
                     break
 
                 if attempt_idx < max(1, args.decompose_retry_max) - 1:
-                    logger.brief(f"[{qi}] attempt {attempt_idx + 1} f1 < 0.81, restarting full decomposition...")
+                    logger.brief(f"[{qi}] attempt {attempt_idx + 1} f1 < {args.retry_f1_target}, "
+                                 "restarting full decomposition...")
                 else:
                     logger.brief(f"[{qi}] reached max decomposition attempts, using best available attempt.")
 
@@ -1903,6 +1970,8 @@ def main() -> None:
         "min_sim": args.min_sim,
         "fill_backend": args.fill_backend,
         "decompose_retry_max": args.decompose_retry_max,
+        "retry_selection": args.retry_selection,
+        "retry_f1_target": args.retry_f1_target,
         "overall_time_stats": compute_time_stats(paper_records),
         "direct_time_stats": compute_time_stats([r for r in paper_records if r.get("path") == "direct"]),
         "decompose_time_stats": compute_time_stats([r for r in paper_records if r.get("path") == "decompose+compose"]),

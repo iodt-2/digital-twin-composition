@@ -1,3 +1,13 @@
 /.idea
+/.venv
 /models
 __pycache__/
+
+# Stage outputs and resume logs
+/outputs
+*.ckpt
+*.done
+progress-*.json
+# due to file size restriction
+data/triplet.jsonl
+data/Qwen2-0.5B-GRPO-Fill-In/

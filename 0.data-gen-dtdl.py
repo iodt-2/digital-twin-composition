@@ -17,13 +17,16 @@ What it does
 Run examples
 ------------
 # Build 10,000 topics in batches of 50, then generate interfaces:
-python dtdl_mass_generator.py --target-topics 10000 --topics-batch 50
+python 0.data-gen-dtdl.py --target-topics 10000 --topics-batch 50
 
 # Seed from a file (e.g., CLS350 CDI description) + build the rest:
-python dtdl_mass_generator.py --target-topics 10000 --topics-batch 50 --seed-file cls350_seed.txt
+python 0.data-gen-dtdl.py --target-topics 10000 --topics-batch 50 --seed-file cls350_seed.txt
 
-# Resume later (reads existing files and continues):
-python dtdl_mass_generator.py --resume
+# Resume later (reads existing files and continues; this is the default):
+python 0.data-gen-dtdl.py
+
+# Start over, truncating the output files:
+python 0.data-gen-dtdl.py --no-resume
 """
 
 import argparse
@@ -32,17 +35,22 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, List, Set
 from string import Template
 
 import requests
 
-DEFAULT_HOST = "http://10.1.1.1:60002"
-DEFAULT_MODEL = "gpt-oss:120b"
+DEFAULT_HOST = os.getenv("OLLAMA_HOST", "http://10.1.1.1:60002")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
 
-TOPICS_JSONL = "topics.jsonl"
-INTERFACES_JSONL = "interfaces.jsonl"
-DONE_TOPICS_LOG = "interfaces_done.txt"
+DATA_DIR = "data"
+TOPICS_JSONL = os.path.join(DATA_DIR, "topics.jsonl")
+INTERFACES_JSONL = os.path.join(DATA_DIR, "interfaces.jsonl")
+DONE_TOPICS_LOG = os.path.join(DATA_DIR, "interfaces_done.txt")
+
+# Give up on topic discovery after this many consecutive rounds that yield nothing
+# new, rather than hammering the server forever when the model has run out of ideas.
+MAX_BARREN_ROUNDS = 5
 
 # ---------------------------
 # Ollama API
@@ -203,22 +211,40 @@ def parse_component_from_id(dtmi_id: str) -> str:
     return m.group(2)
 
 def force_fill_docker_image_value(interface_obj: Dict[str, Any], topic_id: str) -> None:
+    """Guarantee every interface carries a dockerImage Property with a value.
+
+    Downstream stages treat dockerImage as a deployment artifact and filter it out by
+    name, so it has to be present and consistently shaped even when the model forgot it.
+    """
     dtmi_id = interface_obj.get("@id", "")
     component = parse_component_from_id(dtmi_id) or "component"
     desired = f"registry.local/dtm/{topic_id}/{component}:v1.0.0"
-    for entry in interface_obj.get("contents", []):
-        if entry.get("@type") == "Property" and entry.get("name") == "dockerImage" and entry.get("schema") == "string":
+    contents = interface_obj.setdefault("contents", [])
+    for entry in contents:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("@type") == "Property" and entry.get("name") == "dockerImage":
+            entry["schema"] = "string"
             if not entry.get("value"):
                 entry["value"] = desired
             return
+    contents.insert(0, {"@type": "Property", "name": "dockerImage",
+                        "schema": "string", "value": desired})
+
+def ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 def fsync_append_line(path: str, obj: Dict[str, Any]) -> None:
+    ensure_parent_dir(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
         f.flush()
         os.fsync(f.fileno())
 
 def fsync_append_text(path: str, text: str) -> None:
+    ensure_parent_dir(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(text + "\n")
         f.flush()
@@ -276,11 +302,16 @@ def deduplicate_topics(incoming: List[Dict[str, str]], seen_ids: Set[str], seen_
         unique.append({"id": nid, "title": title.strip(), "brief": brief.strip()})
     return unique
 
+# The avoid-list is advisory: past a few hundred entries it stops steering the model and
+# starts dominating the context window (6,000 topics is ~100 kB of prompt). Send a recent
+# window instead — exact deduplication happens locally in `deduplicate_topics` anyway.
+AVOID_LIST_WINDOW = 200
+
 def discover_topics_batch(host: str, model: str, batch_size: int, avoid_ids: List[str], avoid_titles: List[str]) -> List[Dict[str, str]]:
     prompt = TOPIC_PROMPT.substitute(
         num_topics=batch_size,
-        avoid_ids=", ".join(avoid_ids) or "(none)",
-        avoid_titles=", ".join(avoid_titles) or "(none)",
+        avoid_ids=", ".join(avoid_ids[-AVOID_LIST_WINDOW:]) or "(none)",
+        avoid_titles=", ".join(avoid_titles[-AVOID_LIST_WINDOW:]) or "(none)",
     )
     text = ollama_generate(host, model, prompt)
     arr = extract_json_array(text)
@@ -314,7 +345,8 @@ def main():
     ap.add_argument("--target-topics", type=int, default=6000, help="Total unique topics to reach")
     ap.add_argument("--topics-batch", type=int, default=50, help="Topics requested per model call")
     ap.add_argument("--seed-file", default=None, help="Optional path to seed a first topic (e.g., CLS350 CDI description)")
-    ap.add_argument("--resume", default=True, action="store_true", help="Resume from existing files if present")
+    ap.add_argument("--resume", default=True, action=argparse.BooleanOptionalAction,
+                    help="Resume from existing files if present (default: --resume)")
     ap.add_argument("--topics-file", default=TOPICS_JSONL, help="Path to topics JSONL")
     ap.add_argument("--interfaces-file", default=INTERFACES_JSONL, help="Path to interfaces JSONL")
     ap.add_argument("--done-file", default=DONE_TOPICS_LOG, help="Path to processed topics log")
@@ -335,9 +367,9 @@ def main():
     else:
         existing_topics, done_topics = [], set()
         # clear files
-        open(args.topics_file, "w", encoding="utf-8").close()
-        open(args.interfaces_file, "w", encoding="utf-8").close()
-        open(args.done_file, "w", encoding="utf-8").close()
+        for path in (args.topics_file, args.interfaces_file, args.done_file):
+            ensure_parent_dir(path)
+            open(path, "w", encoding="utf-8").close()
         print("[STEP] Initialized output files (fresh run).")
 
     # Build sets for dedup
@@ -372,11 +404,15 @@ def main():
             print(f"[WARN] Seed ingest failed: {e}")
 
     # Discover until target
+    barren_rounds = 0
     while len(topics) < args.target_topics:
         need = args.target_topics - len(topics)
         batch = min(args.topics_batch, need)
-        avoid_ids = sorted(seen_ids)
-        avoid_titles = sorted(seen_titles)
+        # Most recent first: those are the topics the model is likeliest to repeat.
+        avoid_ids = [t["id"] for t in topics]
+        avoid_titles = [t["title"] for t in topics]
+
+        unique: List[Dict[str, str]] = []
         try:
             raw = discover_topics_batch(args.host, args.model, batch, avoid_ids, avoid_titles)
             unique = deduplicate_topics(raw, seen_ids, seen_titles)
@@ -389,10 +425,18 @@ def main():
         # small backoff to be kind to the server
         time.sleep(0.8)
 
-        # If model struggles to produce uniques, don't loop forever
-        if batch > 0 and len(unique) == 0:
-            print("[WARN] No unique topics returned; backing off...")
-            time.sleep(2.0)
+        # If the model struggles to produce uniques, don't loop forever.
+        if unique:
+            barren_rounds = 0
+        else:
+            barren_rounds += 1
+            print(f"[WARN] No unique topics returned "
+                  f"({barren_rounds}/{MAX_BARREN_ROUNDS} barren rounds); backing off...")
+            time.sleep(2.0 * barren_rounds)
+            if barren_rounds >= MAX_BARREN_ROUNDS:
+                print(f"[WARN] Giving up on topic discovery at {len(topics)}/{args.target_topics} "
+                      "topics; continuing to interface generation.")
+                break
 
     print(f"[INFO] Total unique topics available: {len(topics)}")
 

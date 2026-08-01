@@ -1,0 +1,28 @@
+# Verified against Python 3.14 with the versions noted in brackets.
+# Stages are independent; install only what you need.
+
+# --- everywhere ---
+requests>=2.31                  # Ollama and OpenAI-compatible HTTP calls
+
+# --- 0.* data generation, 1.*/2.* training and evaluation ---
+datasets>=3.0                   # [5.0.0]
+numpy>=1.26                     # [2.4.4]
+
+# --- 1.fine-tune-sentence-transformer.py, 2.perf-eval-sentence-transformer.py ---
+sentence-transformers>=3.0      # [5.6.1]
+scikit-learn>=1.3               # paired_cosine_distances in SuperTripletEvaluator
+wandb                           # optional: pass --no-wandb to skip
+
+# --- 1.fine-tune-GRPO-llm.py ---
+trl>=0.9                        # GRPOTrainer
+
+# --- 2.perf-eval-fill-gen-local.py, 3.* ---
+torch>=2.2                      # [2.12.1]
+transformers>=4.40              # [5.12.1] - 5.x renamed torch_dtype to dtype
+faiss-cpu>=1.8                  # or faiss-gpu
+
+# --- 0.data-push-to-huggingface.py, 1.model-push-to-huggingface.py ---
+huggingface-hub>=0.23
+
+# --- 4.deploy-agi-flask.py ---
+flask>=3.0

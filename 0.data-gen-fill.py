@@ -1,18 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Turn `interfaces.jsonl` into the fill-in dataset `fill-eval.jsonl`.
+
+For every DTDL Interface, two Ollama calls produce one record:
+
+    answer : a full instance JSON — the interface id, a plausible value for every
+             Property, and 0 for every Telemetry.
+    anchor : a prose paragraph that states the Property values *only*. It never
+             mentions the interface id, the dockerImage path, or any telemetry, so a
+             model reading it can only recover what the answer legitimately contains.
+
+Records are keyed by a SHA-256 of the input line and logged to `<output>.ckpt`, so an
+interrupted run resumes without regenerating or duplicating anything.
+
+    python 0.data-gen-fill.py --input data/interfaces.jsonl --output data/fill-eval.jsonl
+"""
+
 import argparse
-import json
-import sys
-from typing import Any, Dict, List, Tuple
-import requests
-import re
-import time
-import os
 import hashlib
+import json
+import os
+import re
+import sys
+import time
+from typing import Any, Dict, List, Tuple
+
+import requests
+
+DEFAULT_HOST = os.getenv("OLLAMA_HOST", "http://10.1.1.1:60002")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
+DEFAULT_INPUT = os.path.join("data", "interfaces.jsonl")
+DEFAULT_OUTPUT = os.path.join("data", "fill-eval.jsonl")
+
 
 # -------------------------
-# Ollama 客户端（/api/chat）
+# Ollama client (/api/chat)
 # -------------------------
 class OllamaClient:
     def __init__(self, host: str, model: str, timeout: int = 120):
@@ -37,8 +61,9 @@ class OllamaClient:
             return data["messages"][-1].get("content", "")
         raise RuntimeError(f"Unexpected Ollama response format: {data}")
 
+
 # -------------------------
-# 工具方法
+# Helpers
 # -------------------------
 def json_only(s: str) -> str:
     fence = re.search(r"```json\s*(\{.*?\})\s*```", s, re.S)
@@ -48,6 +73,7 @@ def json_only(s: str) -> str:
     if brace:
         return brace.group(1)
     return s.strip()
+
 
 def cast_value(v: Any, schema: str) -> Any:
     t = (schema or "").lower()
@@ -73,6 +99,7 @@ def cast_value(v: Any, schema: str) -> Any:
     except Exception:
         return str(v)
 
+
 def extract_fields(interface_obj: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
     interface_id = interface_obj.get("@id") or interface_obj.get("id") or ""
     contents = interface_obj.get("contents", []) or []
@@ -87,6 +114,7 @@ def extract_fields(interface_obj: Dict[str, Any]) -> Tuple[str, List[Dict[str, A
             telemetries.append(item)
     return interface_id, properties, telemetries
 
+
 def format_duration(seconds: float) -> str:
     seconds = int(max(0, seconds))
     h = seconds // 3600
@@ -96,8 +124,9 @@ def format_duration(seconds: float) -> str:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
+
 # -------------------------
-# LLM 提示词
+# Prompts
 # -------------------------
 SYSTEM_JSON_VALUES = (
     "You generate realistic, domain-appropriate JSON values ONLY.\n"
@@ -128,7 +157,9 @@ dockerImage_original: {docker_image_original}
 Return ONLY JSON.
 """
 
-# 锚文规则：不包含 interface/DTMI，不包含 dockerImage 路径，不包含任何 Telemetry
+# Anchor rules: no interface id / DTMI, no dockerImage path, no telemetry whatsoever.
+# Anything the anchor leaks that the answer also contains would make the fill-in task
+# solvable by copying rather than by extraction.
 SYSTEM_ANCHOR = (
     "You are a technical writer for digital twins. "
     "Write one concise paragraph (6-8 sentences) describing the instance, "
@@ -151,8 +182,9 @@ allowed fields JSON:
 {allowed_instance_json}
 """
 
+
 # -------------------------
-# 生成 instance / anchor
+# Instance / anchor generation
 # -------------------------
 def build_instance_with_llm(client: OllamaClient, interface_obj: Dict[str, Any]) -> Dict[str, Any]:
     interface_id, properties, telemetries = extract_fields(interface_obj)
@@ -176,18 +208,18 @@ def build_instance_with_llm(client: OllamaClient, interface_obj: Dict[str, Any])
     messages = [{"role": "system", "content": SYSTEM_JSON_VALUES},
                 {"role": "user", "content": user_prompt}]
 
+    gen_props: Dict[str, Any] = {}
     for attempt in range(3):
         try:
             raw = client.chat(messages, temperature=0.6)
-            raw_json = json_only(raw)
-            gen_props = json.loads(raw_json)
+            gen_props = json.loads(json_only(raw))
             break
-        except Exception as e:
+        except Exception:
             if attempt == 2:
                 raise
             time.sleep(1.0)
 
-    # 构造完整 instance（供 answer 使用）
+    # Full instance, used as the `answer`.
     instance: Dict[str, Any] = {"interface": interface_id}
     for p in properties:
         name = p.get("name")
@@ -200,29 +232,27 @@ def build_instance_with_llm(client: OllamaClient, interface_obj: Dict[str, Any])
         else:
             instance[name] = cast_value(gen_props.get(name, ""), schema)
 
+    # Telemetry is runtime data, not something a spec paragraph states: initialise to 0
+    # so the instance is complete, and exclude it from the anchor and from scoring.
     for t in telemetries:
-        name = t.get("name")
-        instance[name] = 0
+        instance[t.get("name")] = 0
 
     return instance
+
 
 def build_anchor_with_llm(
     client: OllamaClient,
     interface_obj: Dict[str, Any],
-    full_instance: Dict[str, Any]
+    full_instance: Dict[str, Any],
 ) -> str:
-    # 仅允许的字段：Property 去掉 dockerImage；排除 interface；完全不含 Telemetry
+    # Allowed fields: Properties minus dockerImage; never `interface`, never Telemetry.
     _, properties, telemetries = extract_fields(interface_obj)
     telemetry_names = {t.get("name") for t in telemetries if isinstance(t, dict)}
     property_names = {p.get("name") for p in properties if isinstance(p, dict)}
 
     allowed = {}
     for k, v in full_instance.items():
-        if k == "interface":
-            continue
-        if k in telemetry_names:
-            continue
-        if k == "dockerImage":
+        if k in ("interface", "dockerImage") or k in telemetry_names:
             continue
         if k in property_names:
             allowed[k] = v
@@ -236,11 +266,13 @@ def build_anchor_with_llm(
     text = re.sub(r"^```.*?\n|\n```$", "", text, flags=re.S)
     return " ".join(text.split())
 
+
 # -------------------------
-# 断点相关
+# Checkpointing
 # -------------------------
 def sha256_line(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 
 def load_checkpoint(path: str) -> set:
     done = set()
@@ -253,88 +285,96 @@ def load_checkpoint(path: str) -> set:
                 done.add(h)
     return done
 
-def append_checkpoint(path: str, h: str):
+
+def append_checkpoint(path: str, h: str) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(h + "\n")
         f.flush()
         os.fsync(f.fileno())
 
+
+class ProgressReporter:
+    """One-line progress with an ETA extrapolated from completed samples only."""
+
+    def __init__(self, total_lines: int):
+        self.total = total_lines
+        self.written = 0
+        self.skipped = 0
+        self.failed = 0
+        self.sample_seconds = 0.0
+        self.started = time.time()
+
+    @property
+    def avg(self) -> float:
+        return (self.sample_seconds / self.written) if self.written else 0.0
+
+    def report(self, line_num: int, message: str) -> None:
+        remaining = max(0, self.total - (self.written + self.skipped + self.failed))
+        eta = self.avg * remaining
+        eta_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + eta))
+        pct = (line_num / self.total * 100) if self.total else 0.0
+        print(f"[{line_num}/{self.total} | {pct:.1f}%] {message} | "
+              f"written={self.written} skipped={self.skipped} failed={self.failed} | "
+              f"avg/sample={format_duration(self.avg)} | "
+              f"ETA {format_duration(eta)} (about {eta_at})", flush=True)
+
+
 # -------------------------
-# 主流程（含 ETA 预测）
+# Main loop
 # -------------------------
 def process_interfaces_file(
     input_path: str,
     output_path: str,
     host: str,
     model: str,
-    limit: int = 0
-):
-    client = OllamaClient(host=host, model=model)
+    timeout: int = 120,
+    limit: int = 0,
+) -> None:
+    client = OllamaClient(host=host, model=model, timeout=timeout)
 
-    # 统计总行数用于进度
     try:
         with open(input_path, "r", encoding="utf-8") as fin:
             total_lines = sum(1 for _ in fin)
-    except Exception as e:
-        print(f"[FATAL] 无法读取输入文件: {e}", file=sys.stderr)
+    except OSError as e:
+        print(f"[FATAL] Cannot read input file: {e}", file=sys.stderr)
         sys.exit(1)
 
     ckpt_path = output_path + ".ckpt"
     processed_hashes = load_checkpoint(ckpt_path)
+    if processed_hashes:
+        print(f"[INFO] Resuming: {len(processed_hashes)} lines already recorded in {ckpt_path}")
 
-    # 输出为追加模式，支持 resume
-    fout = open(output_path, "a", encoding="utf-8")
-    # 统计
-    written = 0
-    skipped = 0
-    failed = 0
+    parent = os.path.dirname(os.path.abspath(output_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
-    # ETA 统计：按「成功写出样本」的平均耗时来估算
-    total_sample_time = 0.0  # 成功样本累计耗时（秒）
-    overall_start_ts = time.time()
+    progress = ProgressReporter(total_lines)
 
-    with open(input_path, "r", encoding="utf-8") as fin:
+    # Append mode: the checkpoint is what makes this safe to re-run.
+    with open(output_path, "a", encoding="utf-8") as fout, \
+            open(input_path, "r", encoding="utf-8") as fin:
         for line_num, line in enumerate(fin, 1):
             raw = line.rstrip("\n")
             if not raw.strip():
-                skipped += 1
-                remaining = max(0, total_lines - (written + skipped + failed))
-                avg = (total_sample_time / written) if written > 0 else 0.0
-                eta_secs = avg * remaining
-                eta_ts = time.time() + eta_secs
-                print(f"[{line_num}/{total_lines}] 空行，跳过 | written={written} skipped={skipped} failed={failed} | "
-                      f"ETA 剩余约 {format_duration(eta_secs)}，预计完成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(eta_ts))}",
-                      flush=True)
+                progress.skipped += 1
+                progress.report(line_num, "blank line, skipped")
                 continue
 
             h = sha256_line(raw)
             if h in processed_hashes:
-                skipped += 1
-                remaining = max(0, total_lines - (written + skipped + failed))
-                avg = (total_sample_time / written) if written > 0 else 0.0
-                eta_secs = avg * remaining
-                eta_ts = time.time() + eta_secs
-                print(f"[{line_num}/{total_lines}] 已处理（resume 命中），跳过 | written={written} skipped={skipped} failed={failed} | "
-                      f"ETA 剩余约 {format_duration(eta_secs)}，预计完成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(eta_ts))}",
-                      flush=True)
+                progress.skipped += 1
+                progress.report(line_num, "already processed (resume hit), skipped")
                 continue
 
             try:
                 iface = json.loads(raw)
-            except Exception as e:
-                failed += 1
+            except json.JSONDecodeError as e:
+                progress.failed += 1
                 append_checkpoint(ckpt_path, h)
                 processed_hashes.add(h)
-                remaining = max(0, total_lines - (written + skipped + failed))
-                avg = (total_sample_time / written) if written > 0 else 0.0
-                eta_secs = avg * remaining
-                eta_ts = time.time() + eta_secs
-                print(f"[{line_num}/{total_lines}] 解析失败，跳过：{e} | written={written} skipped={skipped} failed={failed} | "
-                      f"ETA 剩余约 {format_duration(eta_secs)}，预计完成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(eta_ts))}",
-                      flush=True)
+                progress.report(line_num, f"parse failed, skipped: {e}")
                 continue
 
-            # === 计时开始：单个成功样本 ===
             sample_start = time.time()
             try:
                 full_instance = build_instance_with_llm(client, iface)
@@ -345,57 +385,45 @@ def process_interfaces_file(
                 fout.flush()
                 os.fsync(fout.fileno())
 
+                # Checkpoint only after the record is durably on disk, so a crash
+                # between the two never loses a line or duplicates one.
                 append_checkpoint(ckpt_path, h)
                 processed_hashes.add(h)
 
-                written += 1
-                # 更新样本耗时
-                total_sample_time += (time.time() - sample_start)
+                progress.written += 1
+                progress.sample_seconds += time.time() - sample_start
+                progress.report(line_num, "written")
 
-                pct = (line_num / total_lines) * 100 if total_lines else 0
-                remaining = max(0, total_lines - (written + skipped + failed))
-                avg = (total_sample_time / written) if written > 0 else 0.0
-                eta_secs = avg * remaining
-                eta_ts = time.time() + eta_secs
-                print(f"[{line_num}/{total_lines} | {pct:.1f}%] 写入成功 | written={written} skipped={skipped} failed={failed} | "
-                      f"avg/sample={format_duration(avg)} | "
-                      f"ETA 剩余约 {format_duration(eta_secs)}，预计完成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(eta_ts))}",
-                      flush=True)
-
-                if limit and written >= limit:
-                    print(f"[INFO] 达到 --limit={limit}，结束。", flush=True)
+                if limit and progress.written >= limit:
+                    print(f"[INFO] Reached --limit={limit}, stopping.", flush=True)
                     break
 
             except Exception as e:
-                failed += 1
+                progress.failed += 1
                 append_checkpoint(ckpt_path, h)
                 processed_hashes.add(h)
-                remaining = max(0, total_lines - (written + skipped + failed))
-                avg = (total_sample_time / written) if written > 0 else 0.0
-                eta_secs = avg * remaining
-                eta_ts = time.time() + eta_secs
-                print(f"[{line_num}/{total_lines}] 处理失败，跳过：{e} | written={written} skipped={skipped} failed={failed} | "
-                      f"ETA 剩余约 {format_duration(eta_secs)}，预计完成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(eta_ts))}",
-                      flush=True)
+                progress.report(line_num, f"generation failed, skipped: {e}")
                 continue
 
-    fout.close()
-    total_elapsed = time.time() - overall_start_ts
-    avg = (total_sample_time / written) if written > 0 else 0.0
-    print(f"完成。总行数={total_lines} | 写入={written} 跳过={skipped} 失败={failed} | "
-          f"总耗时={format_duration(total_elapsed)} | avg/sample={format_duration(avg)} | 输出: {output_path}",
-          flush=True)
+    elapsed = time.time() - progress.started
+    print(f"Done. total lines={total_lines} | written={progress.written} "
+          f"skipped={progress.skipped} failed={progress.failed} | "
+          f"elapsed={format_duration(elapsed)} | avg/sample={format_duration(progress.avg)} | "
+          f"output: {output_path}", flush=True)
+
 
 # -------------------------
 # CLI
 # -------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="interfaces.jsonl", help="输入 interfaces.jsonl 路径（默认：interfaces.jsonl）")
-    ap.add_argument("--output", default="fill-eval.jsonl", help="输出 jsonl 路径（默认：fill-eval.jsonl）")
-    ap.add_argument("--host", default="http://10.1.1.1:60002", help="Ollama 主机地址（默认：http://10.1.1.1:60002）")
-    ap.add_argument("--model", default="gpt-oss:120b", help="Ollama 模型名（默认：gpt-oss:120b）")
-    ap.add_argument("--limit", type=int, default=0, help="最多处理多少条（0=全部）")
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--input", default=DEFAULT_INPUT, help=f"Input interfaces JSONL (default: {DEFAULT_INPUT})")
+    ap.add_argument("--output", default=DEFAULT_OUTPUT, help=f"Output JSONL (default: {DEFAULT_OUTPUT})")
+    ap.add_argument("--host", default=DEFAULT_HOST, help=f"Ollama host (default: {DEFAULT_HOST})")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default: {DEFAULT_MODEL})")
+    ap.add_argument("--timeout", type=int, default=120, help="Ollama request timeout in seconds")
+    ap.add_argument("--limit", type=int, default=0, help="Stop after writing N records (0 = all)")
     args = ap.parse_args()
 
     process_interfaces_file(
@@ -403,8 +431,10 @@ def main():
         output_path=args.output,
         host=args.host,
         model=args.model,
+        timeout=args.timeout,
         limit=args.limit,
     )
+
 
 if __name__ == "__main__":
     main()
