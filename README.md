@@ -59,9 +59,17 @@ Scripts are prefixed by pipeline stage. Everything is run from the repository ro
 - `3.system-eval.py` — retrieval → decomposition → composition → fill-in → verification.
 
 ### 4) Deployment
+- `4.deploy.py` — the whole pipeline as one command: query → decomposition → composition
+  → fill-in → DTDL instance → `docker-compose.yaml` → confirm. The request describes
+  independent components, so the decomposition also analyses how the parts would exchange
+  data and the composition turns that into the wiring between the subsystem containers;
+  declining the compose file restarts the lot. Dependency-free once the index and the
+  models are in place.
+- `4.deploy-test.py` — the deployment, tested and scored: runs `4.deploy.py`'s stages for
+  real, retries until retrieval is complete (`-K`, default 10), and grades decomposition,
+  composition, fill-in, the instance and the compose file against the docker-images
+  ground truth. See [Testing the deployment](#testing-the-deployment).
 - `4.deploy-agi-flask.py` — Flask agent loop with SSE streaming and per-step cards.
-- `4.to-docker-compose.py` — turns an instantiated instance into a `docker-compose.yaml`,
-  one service per interface. Dependency-free.
 
 ### Shared code
 - `dependencies/fill_eval_runner.py` — the loop both fill-in backends share (schema
@@ -266,26 +274,181 @@ id, and that file is what maps ids back to topics.
 
 ## Deployment
 
-### From instance to running containers
+### From a query to running containers
 
-The pipeline ends with an instantiated interface; `4.to-docker-compose.py` turns that
-into something you can `docker compose up`:
+`4.deploy.py` runs the whole pipeline and ends at a stack you can bring up:
 
 ```bash
-python 4.to-docker-compose.py data/fill-eval.jsonl --line 1 -o docker-compose.yaml
-python 4.to-docker-compose.py instance.json          # or read stdout
+python 4.deploy.py @../docker-images/sample-query.md -o outputs/deploy
+cd outputs/deploy && docker compose up
 ```
 
-It accepts both instance shapes — the flat one from the direct route, and the
-`{"subsystems": {...}}` one from the composed route, which yields one service per
-subsystem. Per service: `dockerImage` becomes the image, the remaining properties become
+It writes up to six files into `--out-dir` — the first is skipped by
+`--from-interfaces` and the composition's two by a decomposition that came back with a
+single interface — and prints the decomposition, the couplings, the retrieval hits and the
+wiring as it goes:
+
+| File | Stage |
+| ---- | ----- |
+| `decomposition.json` | the sub-queries, what each one retrieved, and the coupling analysis |
+| `wiring.json` | the composition analysis: what was proposed, what was rejected and why |
+| `composed-interface.json` | the new interface the composition creates |
+| `composition.json` | the wiring between the subsystems, for the orchestrator |
+| `instance.json` | the DTDL instance, flat or `{"subsystems": {...}}` |
+| `docker-compose.yaml` | one service per subsystem, plus the orchestrator |
+
+The query is decomposed, each sub-query retrieves its top-1 interface, and the hits
+become one composed interface; a decomposition that yields a single interface is not a
+composition, so it emits the flat instance and one service with no orchestrator. Per
+service, `dockerImage` becomes the image, the remaining properties become
 `UPPER_SNAKE_CASE` environment variables, and the interface id is kept as a
 `dtdl.interface` label. Null properties are dropped, since nothing in the source text
-stated them.
+stated them, and `interface` and `dockerImage` are copied from the catalogue rather than
+asked of the model — the anchors never mention the image path, so a model asked for it
+would be guessing.
 
-Note the generated images are the placeholder `registry.local/dtm/...` paths the
-generator assigns — the file is a deployment *manifest* for a synthesised twin, not a
-reference to images that exist.
+#### The subsystems are independent, and the coupling is analysed
+
+A request describes components, not a system diagram: each subsystem says what it holds,
+what it accepts and what it produces, and nothing about which of the others it exchanges
+data with. Working that out is two of the pipeline's stages.
+
+**Decomposition** splits the request and then, in a second call, analyses how those parts
+would have to exchange data — which part produces what, which part needs it, which needs
+something no part produces. It is a second call because the split prompt is deliberately
+told to keep each sub-query self-contained and to use no facts from another, which is
+what makes each one a usable retrieval query; that prompt is character-identical to
+`3.system-eval.py`'s and stays that way.
+
+**Composition** resolves that intent onto the twins retrieval actually returned. The
+model is given each member's `outputType` (what it serves on its data endpoint) and
+`updateFields` (the exact telemetry keys its update endpoint accepts) and answers with
+the connections between them: image 3 accepts a field called `buildingState`, image 1
+serves a `BuildingState`, so `buildingData → energyForecast as buildingState`. It is not
+shown the `relationships` an interface may declare — that would be reciting the answer.
+
+An analysis is a claim about other interfaces, so every part of it is checked before it
+reaches a compose file: both ends must be members, `as` must be a field the target really
+accepts, one field takes one source, and an edge that closes a cycle is kept but demoted
+to `feedback` — a mutual dependency can only be met by the previous cycle's value, and an
+orchestrator handed a cycle aborts at start-up. Every accepted field no connection feeds
+is then derived as an external input, routed from the caller, so the two halves stay
+exhaustive however the model answered. `wiring.json` records what was proposed, what was
+rejected and why. Where the members do declare relationships, the run also prints how the
+analysis compared with them.
+
+**Measured**, `gpt-oss:120b` on `../docker-images/sample-query.md` — a request that states
+no couplings at all:
+
+| | |
+| --- | --- |
+| Connections recovered | **8/8**, 0 missed, 0 invented; `inputs` and `output` identical to the declared reference |
+| Twins retrieved | 5/5 |
+| Property values | 71/71 against `sample-instance.json` |
+| Containers that start | 6/6, bound through each image's own `load_properties()` |
+| Cycle | the generated stack passes all 32 of `docker-images/test_stack.py`'s coherence and cycle tests |
+
+Two things that took measuring to find. The analysis first recovered only **6/8** — it
+missed `currentBuildingState` (image 5's name for what images 3 and 4 call
+`buildingState`, so the field a `BuildingState` fills is not spelled like the type) and
+`previousPlan` (a twin's own previous output, which reads as coming from whichever twin
+*accepts* plans). Both are addressed by rules in `build_wiring_prompt` that name no
+interface, type or field of this chain: check every accepted field against every member,
+match a field by what it carries rather than how it is spelled, and treat a `previous` /
+`prior` / `last` / `accepted` field as a feedback edge that may come from the target
+itself. And it never invented an edge in any run — with a mis-retrieved member set it
+wired *one* connection and left the rest as external inputs rather than sourcing a
+building state from a weather station.
+
+**The subsystems never call each other.** The generated `docker-compose.yaml` carries a
+`ziren/composition-orchestrator` service bound to the analysed wiring, which reads each
+subsystem's data endpoint and posts to the update endpoints of the subsystems that need
+it. A composition where nothing a member serves fits anything another accepts still
+deploys; it just has no internal wiring, and every field is an input.
+
+#### The last stage is yours
+
+The compose file is printed and confirmed before it is anything to run:
+
+```
+[y] accept and deploy this stack   [r] restart the process   [q] quit
+```
+
+`r` restarts the whole process — a new decomposition, a new coupling analysis, a new
+retrieval, a new composition — and asks for one line of feedback first, which is appended
+to every prompt of the next attempt. Decoding is greedy, so the seed moves on each
+attempt too; a restart that changed nothing would otherwise return the stack that was
+just declined. `--max-attempts` bounds it (5 by default) and `-y` skips the question,
+as does a non-interactive stdin.
+
+This stage is load-bearing, not decorative, and the reason is measured. **Retrieval on a
+coupling-free request is not reliable on the first attempt**: four attempt-1 runs of the
+sample query retrieved 3/5, 3/5, 3/5 and 5/5. When the split summarises a subsystem's
+paragraph instead of carrying it over, the summary drifts toward generic building-IoT
+vocabulary and lands on the wrong interface — measured at 0.4473 to the right interface
+against 0.5675 to the wrong one, where the paragraph itself scores 0.7149. One line of
+feedback — *"Do not summarise. Each sub-query must carry that subsystem's whole
+description from the request, word for word"* — restores verbatim copying and 5/5, with
+the sub-queries coming back at exactly the paragraph lengths and the paragraphs' scores.
+Wording inside the request cannot substitute: text under `DESCRIPTION:` is read as
+content, while feedback arrives after it as an instruction. That asymmetry is why
+declining and restarting is part of the pipeline rather than advice in a README.
+
+#### Without the models
+
+`--from-interfaces` composes named interface files and skips decomposition and retrieval;
+`--no-fill` emits the instance with null properties instead of calling the fill-in model,
+and selects `--wiring declared` — the connections the catalogue's `relationships` imply,
+which needs no model. Together they are an offline catalogue-to-compose generator, and
+the way `orchestrator/composition.example.json` in the other repository is regenerated:
+
+```bash
+python 4.deploy.py --from-interfaces ../docker-images/image*/dtdl/interface.jsonl \
+                   --no-fill -o outputs/wiring
+```
+
+`--wiring` takes `analysed`, `declared` or `auto` (the default: `declared` under
+`--no-fill`, `analysed` otherwise), so `--from-interfaces --wiring analysed` composes a
+named set of interfaces by analysis — which, against a catalogue that declares its
+couplings, is how the analysis is scored.
+
+### Testing the deployment
+
+`4.deploy-test.py` runs the whole pipeline through `4.deploy.py`'s own `attempt()` and
+scores every stage against the docker-images ground truth — no copy of the pipeline, no
+mocks, four real model calls per attempt:
+
+```bash
+python 4.deploy-test.py                    # sample query, up to 10 attempts
+python 4.deploy-test.py -K 3 --no-cycle    # fewer retries, skip the stack suite
+python 4.deploy-test.py --score-only outputs/deploy-test/attempt-02   # offline
+```
+
+When retrieval does not return every expected twin, it retries — up to `-K` times
+(default 10) — sending the restart feedback and moving the decoding seed exactly as a
+user declining the stack would, and each attempt keeps its artefacts in its own
+`attempt-NN/` directory. The accepted attempt is then scored:
+
+| Stage | Scored against | Gate |
+| ----- | -------------- | ---- |
+| 1. Decomposition | one part per subsystem, retrieval complete; coupling flows vs the declared chain | retrieval (couplings informational) |
+| 2. Composition | connections recovered / missed / invented vs `derive_wiring`, plus `inputs` and `output` | all recovered, none invented |
+| 3. Fill-in | every property value vs `sample-instance.json` | 100% |
+| 4. The instance | shape: catalogue property sets, no telemetry, wiring embedded unchanged | all checks |
+| 5. Compose file | services, images, ports, environment, `COMPOSITION`; start-up through each image's own `load_properties()`; docker-images' full stack suite driven on the generated file | all checks |
+
+It prints per-section PASS/FAIL, writes `report.json` with the metrics (recall,
+precision, per-interface fill-in accuracy, per-attempt timings), and exits 0 only when
+everything gated passes — so it can sit in a shell `&&`. The coupling analysis is
+reported but not gated: it is intent for the composition stage to correct, and the
+corrected wiring is what gates.
+
+Note that for a synthesised twin the generated image is the placeholder
+`registry.local/dtm/...` path the generator assigned — that file is a deployment
+*manifest*, not a reference to images that exist. The
+[docker-images](https://github.com/iodt-2/docker-images) catalogue entries are the
+exception: they name images published on Docker Hub, so a stack composed from them
+comes up.
 
 ### Agent UI demo
 
