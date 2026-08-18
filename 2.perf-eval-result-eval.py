@@ -1,37 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Score filled-output files against the answers in `fill-eval.jsonl`.
-
-    # every model directory under results/
-    python 2.perf-eval-result-eval.py
-
-    # one specific prediction file
-    python 2.perf-eval-result-eval.py --pred results/gemini-2.5-pro/filled-output-gemini-2.5-pro.jsonl
-
-Prediction files must be line-aligned with the eval file: line N of the prediction is
-the answer to line N of `fill-eval.jsonl`. The fill-in scripts guarantee this by
-writing `{}` for records they could not process; those rows are then excluded here
-rather than counted as total failures, so a backend is scored on what it attempted.
-
-What is compared
-----------------
-Keys of `answer` excluding `interface` and `dockerImage` (neither is stated in the
-anchor) and excluding zero-valued keys, which are the telemetry placeholders the
-generator initialises to 0. A value mismatch counts as both a false positive and a
-false negative, so precision and recall both see it.
-"""
-
 import argparse
 import json
 import math
 import os
 import pathlib
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 IGNORE_KEYS = {"interface", "dockerImage"}
 DEFAULT_EVAL = os.path.join("data", "fill-eval.jsonl")
+DEFAULT_FILL_DATASET = os.path.join("data", "llm-fill-ft-80-20.ds")
 DEFAULT_PRED_ROOT = "results"
+
+# Must stay equal to the defaults of `1.fine-tune-GRPO-llm.py`; the shards only line up
+# with what training saw if every one of the three matches.
+SPLIT_TEST_SIZE = 0.3
+SPLIT_SEED = 42
+TRAINED_SPLIT = "test"  # the shard `1.fine-tune-GRPO-llm.py --split test` trains on
 
 
 def is_zero_value(v: Any) -> bool:
@@ -58,6 +43,181 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
             except json.JSONDecodeError as e:
                 raise ValueError(f"JSON parse failed at {path}:{line_no}: {e}")
     return out
+
+
+def gold_sources(args) -> Dict[int, Dict[str, Any]]:
+    """Row count -> the gold a prediction file of that length was produced against.
+
+    The two fill-in backends read different inputs: the Gemini one `fill-eval.jsonl`
+    (27,770 lines), the local/Ollama one a split of the fine-tuning dataset (5,554 rows
+    in `test`). A run is line-aligned with whatever it read and nothing else, so the row
+    count identifies its gold unambiguously - which is what lets one invocation score
+    every backend into one table. An input that is not on disk is simply skipped, so
+    this works with either half of the pair present.
+    """
+    sources: Dict[int, Dict[str, Any]] = {}
+
+    if os.path.exists(args.eval):
+        gold = load_jsonl(args.eval)
+        if args.ft_dataset:
+            # Fatal on purpose: if the mapping from shard index to eval line is wrong,
+            # every score below is computed on the wrong rows.
+            verify_ft_alignment(args.ft_dataset, gold)
+        shard = (f"whole file ({len(gold)} rows)" if args.split == "all"
+                 else f"'{args.split}' shard of "
+                      f"train_test_split(test_size={args.test_size}, seed={args.seed})")
+        sources[len(gold)] = {
+            "gold": gold, "name": os.path.basename(args.eval), "scope": f"{args.eval}, {shard}",
+            "rows": select_rows(len(gold), args.split, args.test_size, args.seed,
+                                args.top_percent),
+            "shard_warning": (
+                f"The '{TRAINED_SPLIT}' shard is what 1.fine-tune-GRPO-llm.py trains on. "
+                "Scores for a fine-tuned checkpoint measure memorisation, not extraction."
+                if args.split == TRAINED_SPLIT else
+                f"--split all includes the {math.ceil(args.test_size * len(gold))} training "
+                "rows. Fine-tuned checkpoints are flattered by this; other backends are "
+                "unaffected." if args.split == "all" else ""),
+        }
+
+    if os.path.isdir(args.dataset):
+        gold = load_dataset_gold(args.dataset, args.dataset_split)
+        rows = list(range(len(gold)))
+        if args.top_percent < 100:
+            # A saved split is already in permutation order, so a prefix of it is a
+            # uniform sub-sample, exactly as for a reproduced shard.
+            rows = rows[:max(1, int(math.floor(len(rows) * args.top_percent / 100.0)))]
+        if len(gold) in sources:
+            raise ValueError(
+                f"{args.eval} and {args.dataset}[{args.dataset_split}] both hold "
+                f"{len(gold)} rows, so a prediction file cannot be attributed to one of "
+                "them. Pass --eval or --dataset to score against a single input.")
+        sources[len(gold)] = {
+            "gold": gold, "rows": rows,
+            "name": f"{os.path.basename(args.dataset.rstrip('/\\'))}[{args.dataset_split}]",
+            "scope": f"{args.dataset}, '{args.dataset_split}' split ({len(gold)} rows)",
+            # The split was taken when the dataset was built; there is no shard to warn
+            # about, only the half a fine-tune consumed.
+            "shard_warning": ("'train' is the split an 80/20 fine-tune consumed. Scores for "
+                              "a checkpoint trained on it measure memorisation, not "
+                              "extraction." if args.dataset_split == "train" else ""),
+        }
+
+    return sources
+
+
+def load_dataset_gold(path: str, split: str) -> List[Dict[str, Any]]:
+    """Gold answers from a `save_to_disk` dataset, in row order.
+
+    `2.perf-eval-fill-gen-local.py` runs over one split of the fine-tuning dataset, so
+    its predictions are line-aligned with that split, not with `fill-eval.jsonl`. The
+    `ground_truth` column is already the answer with `interface`, `dockerImage` and the
+    zeroed telemetry removed — the same set `evaluate_pair` calls required — so it is
+    read straight into the shape the scorer expects.
+    """
+    from datasets import load_from_disk
+
+    data = load_from_disk(path)
+    if isinstance(data, dict):
+        if split not in data:
+            raise ValueError(f"{path} has no split {split!r}: {list(data)}")
+        data = data[split]
+    if "ground_truth" not in data.column_names:
+        raise ValueError(f"{path}[{split}] has no `ground_truth` column: {data.column_names}")
+    return [{"answer": json.loads(gt)} for gt in data["ground_truth"]]
+
+
+def split_indices(n_rows: int, test_size: float, seed: int) -> Dict[str, List[int]]:
+    if not (0 < test_size < 1):
+        raise ValueError(f"--test-size must be in (0, 1), got {test_size}")
+
+    try:
+        from datasets import Dataset
+    except ImportError:
+        pass
+    else:
+        shards = Dataset.from_dict({"row": list(range(n_rows))}).train_test_split(
+            test_size=test_size, seed=seed
+        )
+        return {name: list(shards[name]["row"]) for name in ("train", "test")}
+
+    try:
+        import numpy as np
+    except ImportError as e:  # pragma: no cover - one of the two is always installed
+        raise RuntimeError(
+            "Reproducing the training split needs either `datasets` or `numpy` installed."
+        ) from e
+
+    n_test = math.ceil(test_size * n_rows)
+    permutation = np.random.default_rng(seed).permutation(n_rows)
+    return {
+        "test": [int(i) for i in permutation[:n_test]],
+        "train": [int(i) for i in permutation[n_test:]],
+    }
+
+
+def select_rows(n_rows: int, split: str, test_size: float, seed: int,
+                top_percent: float) -> List[int]:
+    """0-based line numbers of `fill-eval.jsonl` to score, ascending."""
+    if not (0 < top_percent <= 100):
+        raise ValueError(f"--top_percent must be in (0, 100], got {top_percent}")
+
+    rows = list(range(n_rows)) if split == "all" else split_indices(n_rows, test_size, seed)[split]
+
+    if top_percent < 100:
+        # A shard is in permutation order, so a prefix of it is a uniform random
+        # sub-sample of the shard - a cheap smoke test that is not biased towards the
+        # front of the corpus. For `--split all` there is no permutation and this stays
+        # the positional prefix it always was.
+        rows = rows[:max(1, int(math.floor(len(rows) * top_percent / 100.0)))]
+
+    return sorted(rows)
+
+
+def _ft_prompt_text(prompt: Any) -> str:
+    """The fine-tuning dataset's `prompt` column, flat or chat-shaped, as one string."""
+    if isinstance(prompt, list):
+        return " ".join(
+            str(m.get("content", "")) if isinstance(m, dict) else str(m) for m in prompt
+        )
+    return str(prompt or "")
+
+
+def verify_ft_alignment(ft_path: str, gold: Sequence[Dict[str, Any]], sample: int = 200) -> None:
+    """Check that the fine-tuning dataset really is `fill-eval.jsonl`, row for row.
+
+    Reproducing the split is only meaningful if shard index i names line i+1 of the eval
+    file. That holds because the dataset is built one row per line in file order, but it
+    is an assumption, and a silently wrong one would hand back a "held-out" set that
+    overlaps training. So: same row count, and every sampled row's prompt still carries
+    that line's anchor verbatim (`build_prompt` embeds it unchanged).
+    """
+    from datasets import load_from_disk
+
+    ft = load_from_disk(ft_path)
+    if isinstance(ft, dict):  # DatasetDict - the fill-in dataset is saved single-split
+        ft = ft.get("train") or next(iter(ft.values()))
+
+    if len(ft) != len(gold):
+        raise ValueError(
+            f"[{ft_path}] holds {len(ft)} rows but the eval file holds {len(gold)}. The "
+            "split cannot be mapped onto eval lines; pass the dataset training actually used."
+        )
+    if "prompt" not in ft.column_names:
+        print(f"[WARN] {ft_path} has no `prompt` column; row alignment left unchecked.")
+        return
+
+    step = max(1, len(ft) // max(1, sample))
+    checked = 0
+    for i in range(0, len(ft), step):
+        anchor = str(gold[i].get("anchor", "")).strip()
+        if anchor and anchor not in _ft_prompt_text(ft[i]["prompt"]):
+            raise ValueError(
+                f"[{ft_path}] row {i} does not contain the anchor of eval line {i + 1}. The "
+                "fine-tuning dataset is not row-aligned with the eval file, so the shard "
+                "indices do not name eval lines."
+            )
+        checked += 1
+    print(f"[INFO] Row alignment verified against {ft_path}: {len(ft)} rows, {checked} anchors sampled.")
 
 
 def evaluate_pair(
@@ -166,23 +326,32 @@ def load_time_stats_from_dir(model_dir: pathlib.Path) -> Dict[str, float]:
     return stats
 
 
-def evaluate_one(gold_path: str, pred_path: str, tol: float, top_percent: float = 100.0) -> Dict[str, Any]:
-    gold = load_jsonl(gold_path)
-    pred = load_jsonl(pred_path)
-    if len(gold) != len(pred):
+def evaluate_one(gold: Sequence[Dict[str, Any]], pred_path: str, tol: float,
+                 rows: Iterable[int], allow_partial: bool = False,
+                 pred: Optional[List[Dict[str, Any]]] = None,
+                 gold_name: str = "") -> Dict[str, Any]:
+    pred = load_jsonl(pred_path) if pred is None else pred
+    if allow_partial and len(pred) < len(gold):
+        # A dataset run is resumable and expensive, so an unfinished one is a normal
+        # state to want a number from. Its rows are appended in input order and never
+        # out of it, so the file is always a prefix of the split - scoring the rows it
+        # reached is still scoring the right rows.
+        print(f"[WARN] {pred_path} holds {len(pred)} of {len(gold)} rows — an unfinished "
+              f"run, scored over that prefix against {gold_name or 'the gold'}. Its length "
+              "names no input, so check that is the one it was generated from.")
+        rows = [i for i in rows if i < len(pred)]
+    elif len(gold) != len(pred):
         raise ValueError(f"[{pred_path}] line counts differ: eval={len(gold)}, pred={len(pred)}. "
                          "Predictions must be line-aligned with the eval file.")
 
-    if not (0 < top_percent <= 100):
-        raise ValueError(f"--top_percent must be in (0, 100], got {top_percent}")
-    use_n = max(1, int(math.floor(len(gold) * top_percent / 100.0)))
-    gold, pred = gold[:use_n], pred[:use_n]
-
     global_tp = global_fp = global_fn = global_required = 0
-    rows_exact_match = rows_evaluated = rows_skipped_empty_pred = 0
+    rows_exact_match = rows_evaluated = rows_skipped_empty_pred = rows_in_scope = 0
     per_key_agg: Dict[str, Dict[str, int]] = {}
 
-    for g, p in zip(gold, pred):
+    for i in rows:
+        rows_in_scope += 1
+        g, p = gold[i], pred[i]
+
         # An empty object means the backend never produced a prediction for this row.
         if isinstance(p, dict) and not p:
             rows_skipped_empty_pred += 1
@@ -209,6 +378,8 @@ def evaluate_one(gold_path: str, pred_path: str, tol: float, top_percent: float 
 
     return {
         "model": model_label_from_path(pred_path),
+        "gold": gold_name,
+        "scored_rows": rows_in_scope,
         "evaluated_rows": rows_evaluated,
         "skipped_empty_pred_rows": rows_skipped_empty_pred,
         "required_fields": global_required,
@@ -224,6 +395,9 @@ def evaluate_one(gold_path: str, pred_path: str, tol: float, top_percent: float 
 def print_one_metrics(m: Dict[str, Any]) -> None:
     print(f"\n================ {m['model']} ================\n")
     print("=== Overall ===")
+    if m.get("gold"):
+        print(f"Scored against                  : {m['gold']}")
+    print(f"Rows in scored shard            : {m['scored_rows']}")
     print(f"Number of rows                  : {m['evaluated_rows']}")
     print(f"Skipped empty predictions       : {m['skipped_empty_pred_rows']}")
     print(f"Required fields                 : {m['required_fields']}")
@@ -243,15 +417,19 @@ def print_one_metrics(m: Dict[str, Any]) -> None:
     print()
 
 
-def print_summary_table(ms: List[Dict[str, Any]]) -> None:
+def print_summary_table(ms: List[Dict[str, Any]], caption: str) -> None:
     if not ms:
         return
+    # `gold` earns its column only when the files did not all come from one input.
     cols = ["model", "precision", "recall", "f1", "accuracy_union", "em_row"]
+    if len({m.get("gold", "") for m in ms}) > 1:
+        cols.insert(1, "gold")
     widths = {
         c: max(len(c), max(len(f"{m[c]:.4f}") if isinstance(m[c], float) else len(str(m[c])) for m in ms))
         for c in cols
     }
     print("\n====== Summary ======")
+    print(caption)
     print(" | ".join(c.ljust(widths[c]) for c in cols))
     print("-+-".join("-" * widths[c] for c in cols))
     for m in ms:
@@ -266,12 +444,37 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--eval", default=DEFAULT_EVAL, help=f"fill-eval JSONL with answers (default: {DEFAULT_EVAL})")
+    ap.add_argument("--dataset", default=DEFAULT_FILL_DATASET,
+                    help="save_to_disk dataset holding the gold for predictions from "
+                         f"2.perf-eval-fill-gen-local.py (default: {DEFAULT_FILL_DATASET}). "
+                         "Files are matched to it or to --eval by row count, so both kinds "
+                         "can be scored in one run; --split, --test-size and --seed apply "
+                         "only to --eval")
+    ap.add_argument("--dataset-split", default="test",
+                    help="Split of --dataset the predictions were generated from (default: test)")
+    ap.add_argument("--partial", action="store_true",
+                    help="Also score prediction files that stop short of the end, over the "
+                         "prefix they reached. Only sound for --dataset runs, whose rows are "
+                         "appended in input order; a short fill-eval file stays an error")
     ap.add_argument("--pred", nargs="*", help=f"Prediction files (default: scan {DEFAULT_PRED_ROOT}/*/)")
     ap.add_argument("--pred-root", default=DEFAULT_PRED_ROOT, help="Directory scanned when --pred is omitted")
     ap.add_argument("--tol", type=float, default=0.0, help="Absolute tolerance for float comparison")
-    ap.add_argument("--top_percent", type=float, default=70.0,
-                    help="Compare only the first N%% of rows, so partially-finished runs stay "
-                         "comparable with each other (default: 70)")
+    ap.add_argument("--split", choices=["train", "test", "all"], default="train",
+                    help="Which shard of the same train_test_split the fine-tuning script uses. "
+                         f"'{TRAINED_SPLIT}' is what training consumed, so the default 'train' is "
+                         "the held-out 70%% (default: train)")
+    ap.add_argument("--test-size", type=float, default=SPLIT_TEST_SIZE,
+                    help=f"Fraction held out by train_test_split (default: {SPLIT_TEST_SIZE}; "
+                         "must match 1.fine-tune-GRPO-llm.py)")
+    ap.add_argument("--seed", type=int, default=SPLIT_SEED,
+                    help=f"Split seed (default: {SPLIT_SEED}; must match 1.fine-tune-GRPO-llm.py)")
+    ap.add_argument("--ft-dataset", default=None,
+                    help="Fine-tuning dataset directory (e.g. llm-fill-ft.ds). When given, its "
+                         "row alignment with the eval file is verified before scoring")
+    ap.add_argument("--top_percent", type=float, default=100.0,
+                    help="Score only this %% of the selected shard, as a cheap smoke test. Drawn in "
+                         "permutation order, so it is a random sub-sample of the shard rather than "
+                         "a prefix of the corpus (default: 100)")
     args = ap.parse_args()
 
     pred_list = args.pred or discover_pred_files(args.pred_root)
@@ -279,19 +482,50 @@ def main() -> None:
         print(f"[ERROR] No prediction files found under {args.pred_root}/. Pass --pred explicitly.")
         return
 
+    try:
+        sources = gold_sources(args)
+    except (OSError, ValueError, ImportError) as e:
+        print(f"[ERROR] Could not read the gold answers: {e}")
+        return
+    if not sources:
+        print(f"[ERROR] Neither {args.eval} nor {args.dataset} exists; nothing to score against.")
+        return
+
+    for source in sources.values():
+        print(f"[INFO] {source['scope']}: {len(source['rows'])} of "
+              f"{len(source['gold'])} rows scored.")
+        if source["shard_warning"]:
+            print(f"[WARN] {source['shard_warning']}")
+    if args.top_percent < 100:
+        print(f"[INFO] --top_percent {args.top_percent}: a sub-sample, for a quick check only.")
+
     results: List[Dict[str, Any]] = []
     for pred_path in (str(pathlib.Path(p)) for p in pred_list):
         if not os.path.exists(pred_path):
             print(f"[WARN] Not found, skipping: {pred_path}")
             continue
         try:
-            metrics = evaluate_one(args.eval, pred_path, args.tol, args.top_percent)
+            pred = load_jsonl(pred_path)
+            source = sources.get(len(pred))
+            if source is None and args.partial:
+                # Unfinished, so its length names no input: the longest gold it could be a
+                # prefix of is the only candidate.
+                source = next((s for n, s in sorted(sources.items()) if n > len(pred)), None)
+            if source is None:
+                raise ValueError(
+                    f"{len(pred)} rows match no input ("
+                    + ", ".join(f"{s['name']}={n}" for n, s in sorted(sources.items()))
+                    + "). Predictions must be line-aligned with what produced them"
+                    + ("" if args.partial else "; pass --partial to score an unfinished run"))
+            metrics = evaluate_one(source["gold"], pred_path, args.tol, source["rows"],
+                                   allow_partial=args.partial, pred=pred,
+                                   gold_name=source["name"])
             print_one_metrics(metrics)
             results.append(metrics)
         except Exception as e:  # noqa: BLE001 - one bad file must not hide the others
             print(f"[ERROR] Failed: {pred_path} -> {e}")
 
-    print_summary_table(results)
+    print_summary_table(results, "Scored against the input each file is aligned with.")
 
 
 if __name__ == "__main__":

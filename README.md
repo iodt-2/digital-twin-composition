@@ -46,10 +46,12 @@ Scripts are prefixed by pipeline stage. Everything is run from the repository ro
   card measured from the checkpoint itself and the logged reward curve.
 
 ### 2) Performance evaluation
-- `2.perf-eval-fill-gen-local.py` — fill-in with a **local Transformers** model.
+- `2.perf-eval-fill-gen-local.py` — fill-in over the fine-tuning dataset
+  (`data/llm-fill-ft-80-20.ds`), with a **local Transformers** model or `--ollama`.
 - `2.perf-eval-fill-gen-gemini.py` — fill-in through a Gemini/OpenAI-compatible endpoint.
-- `2.perf-eval-result-eval.py` — scores prediction files against `fill-eval.jsonl`
-  (precision / recall / F1 / exact match) and prints a comparison table.
+- `2.perf-eval-result-eval.py` — scores prediction files against `fill-eval.jsonl`, or
+  with `--dataset` against a split of `llm-fill-ft-80-20.ds` (precision / recall / F1 /
+  exact match), and prints a comparison table.
 - `2.perf-eval-sentence-transformer.py` — benchmarks embedding models on the held-out
   triplet split.
 
@@ -218,17 +220,25 @@ and tops out at 1.0. **Use it for new runs**; it will not reproduce the publishe
 ### Step 4 — Run fill-in inference
 
 ```bash
-# local checkpoint
+# local checkpoint, over the held-out 20% of data/llm-fill-ft-80-20.ds
 python 2.perf-eval-fill-gen-local.py --model models/Qwen2-0.5B-GRPO-Fill-In
+
+# the same rows, generated on an Ollama server instead
+OLLAMA_HOST=http://10.10.10.4:11434 \
+python 2.perf-eval-fill-gen-local.py --ollama --model gpt-oss:120b
 
 # hosted, OpenAI-compatible
 export OPENAI_API_KEY=...
 python 2.perf-eval-fill-gen-gemini.py --model models/gemini-2.5-pro
 ```
 
-Both write `results/<label>/filled-output-<label>.jsonl`, one row per input line —
-including `{}` for records they could not process, which keeps the file line-aligned with
-`fill-eval.jsonl`. Both resume from the `.done` file.
+All of them write `results/<label>/filled-output-<label>.jsonl`, one row per input
+record — including `{}` for records they could not process, which keeps the file
+line-aligned with the input — and all of them resume from the `.done` file. The Gemini
+backend reads `fill-eval.jsonl`; the local/Ollama one reads the dataset split, whose rows
+already carry both the prompt and the answer. A refused connection or an HTTP timeout is
+*not* recorded as a failed record: it aborts the run with nothing written for that row,
+because a server that is down would otherwise burn every remaining row as `{}`.
 
 ### Step 5 — Score the predictions
 
@@ -237,7 +247,24 @@ python 2.perf-eval-result-eval.py                       # everything under resul
 python 2.perf-eval-result-eval.py \
   --pred results/gemini-2.5-pro/filled-output-gemini-2.5-pro.jsonl \
   --tol 0.0 --top_percent 70
+
+# a run that is still going: score the rows it has reached
+python 2.perf-eval-result-eval.py --partial \
+  --pred results/gpt-oss-120b/filled-output-gpt-oss-120b.jsonl
 ```
+
+The two fill-in backends read different inputs — `fill-eval.jsonl` (27,770 lines) and a
+split of `llm-fill-ft-80-20.ds` (5,554 rows in `test`) — and a run is line-aligned with
+whatever it read. The scorer keys on that: it loads both inputs, matches each prediction
+file to the one whose row count it has, and prints them in one table with a `gold` column
+naming the input. So the bare command still scores everything under `results/`, whichever
+backend produced it. `--split`, `--test-size` and `--seed` apply only to the
+`fill-eval.jsonl` half; `--dataset` and `--dataset-split` point at the other.
+
+`--partial` additionally scores a file that stops short of the end, over the prefix it
+reached: rows are appended in input order, so an unfinished run still yields a number for
+what it did. Its length names no input, so the scorer says which gold it assumed — check
+that line before quoting the number.
 
 Rows whose prediction is `{}` are excluded rather than scored as total failures, so a
 backend is measured on what it attempted; the count is reported separately.
