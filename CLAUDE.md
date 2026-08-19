@@ -183,7 +183,8 @@ Four invariants hold the pipeline together. Most bugs here are violations of one
   the Gemini stats files under `results/` still carry that error and the README documents
   it. Do not "correct" the stored files — they are recorded measurements.
 - **Configuration is CLI flags with env-var defaults** (`OLLAMA_HOST`, `OLLAMA_MODEL`,
-  `FAISS_INDEX_PATH`, `SENTENCE_TRANSFORMER_PATH`, `LOCAL_MODEL`, `OPENAI_API_KEY`, ...).
+  `FAISS_INDEX_PATH`, `SENTENCE_TRANSFORMER_PATH`, `LOCAL_MODEL`, `FILL_DATASET`,
+  `GEMINI_MODEL`, `GOOGLE_CLOUD_PROJECT`, `GEMINI_API_KEY`, ...).
   Never hard-code a key or a host in a new script.
 - **Failures skip, runs continue.** A bad record logs and moves on; only a missing input
   file or an unusable model is fatal. Long runs are expensive to restart.

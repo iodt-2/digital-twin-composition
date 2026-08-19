@@ -31,6 +31,11 @@ Scripts are prefixed by pipeline stage. Everything is run from the repository ro
   - `answer` — the full instance JSON (interface id, all properties, telemetry zeroed)
 
   Checkpointed per input line in `<output>.ckpt`, so it resumes safely.
+- `0.data-gen-fill-ft-dataset.py` — turns `fill-eval.jsonl` + `interfaces.jsonl` into the
+  `save_to_disk` dataset the stage-1 and stage-2 scripts read (`row`, `prompt`,
+  `ground_truth`, `interface`, `n_fields`). `--prompt` picks the prompt format and
+  `--like` mirrors an existing build's split row for row. See
+  [Fill-in prompt formats](#fill-in-prompt-formats).
 - `0.data-gen-interface-to-triplet.py` — builds `data/triplet.jsonl`
   (`query` / `positive` / `negative`) for retrieval training. Negatives are sampled from
   a different topic, filtered lexically, then verified by an LLM judge.
@@ -47,8 +52,14 @@ Scripts are prefixed by pipeline stage. Everything is run from the repository ro
 
 ### 2) Performance evaluation
 - `2.perf-eval-fill-gen-local.py` — fill-in over the fine-tuning dataset
-  (`data/llm-fill-ft-80-20.ds`), with a **local Transformers** model or `--ollama`.
-- `2.perf-eval-fill-gen-gemini.py` — fill-in through a Gemini/OpenAI-compatible endpoint.
+  (`data/llm-fill-ft-80-20-iface.ds` by default), with a **local Transformers** model or
+  `--ollama`.
+- `2.perf-eval-fill-gen-gemini.py` — fill-in over the same kind of dataset
+  (`data/llm-fill-ft-80-20.ds` by default), through **Gemini** on Vertex AI or
+  `--gemini-api`.
+  Both send the row's `prompt` as it is stored and recover the fields and DTDL types the
+  answer is coerced to from that prompt's `- "name" (schema)` lines, so pointing them at
+  the same `--dataset` and `--split` makes the two runs differ in nothing but the model.
 - `2.perf-eval-result-eval.py` — scores prediction files against `fill-eval.jsonl`, or
   with `--dataset` against a split of `llm-fill-ft-80-20.ds` (precision / recall / F1 /
   exact match), and prints a comparison table.
@@ -99,6 +110,10 @@ Shipped under `data/`:
 
 Produced by the pipeline:
 
+- `data/llm-fill-ft-80-20.ds` and `data/llm-fill-ft-80-20-iface.ds` — the fill-in
+  fine-tuning datasets, from `0.data-gen-fill-ft-dataset.py`. Same 22,216 / 5,554 split
+  over the same rows in the same order, and identical `ground_truth`; they differ only in
+  `prompt`. See [Fill-in prompt formats](#fill-in-prompt-formats).
 - `models/faiss.index`, `models/embeddings.npy`, `models/metadata.json`,
   `data/dataset_original.jsonl` — from `3.build-faiss-index.py`, all four index-aligned.
 - `results/<label>/filled-output-<label>.jsonl` plus `.done`, `progress-*.json` and
@@ -217,6 +232,49 @@ perfect answer is therefore worth 0.8 — which is exactly where the logged curv
 `--reward corrected` accepts both fenced and bare JSON, compares floats with a tolerance,
 and tops out at 1.0. **Use it for new runs**; it will not reproduce the published curve.
 
+### Fill-in prompt formats
+
+`0.data-gen-fill-ft-dataset.py` writes two prompt formats over the same rows, so a
+checkpoint trained on one can be compared against the other without any other variable
+moving:
+
+```bash
+# `fields` — what data/llm-fill-ft-80-20.ds ships with
+python 0.data-gen-fill-ft-dataset.py --prompt fields \
+  --output data/llm-fill-ft-80-20.ds
+
+# `interface` — the DTDL definition in place of the field list
+python 0.data-gen-fill-ft-dataset.py --prompt interface \
+  --like data/llm-fill-ft-80-20.ds --output data/llm-fill-ft-80-20-iface.ds
+```
+
+`fields` names the interface inline and lists the fields to fill as
+`- "name" (schema)`. It is `dependencies/fill_eval_runner.build_prompt`
+character-for-character, which is what the two jsonl-driven backends send and what the
+published model card documents, so the two stay in step.
+
+`interface` drops that list and hands over the interface itself, minified — the same way
+`3.system-eval.py` and `4.deploy.py` give an interface to a fill-in prompt. The model has
+to read the DTDL and work out which fields are fillable, rather than being handed the
+answer's key set. `--interface-content` controls how much of it goes in: `full` (the
+default) is the catalogue entry unchanged, telemetry and the `dockerImage` path included;
+`no-docker` drops the image the anchor is forbidden to mention; `properties-only` also
+drops telemetry, leaving the prompt's keys exactly the keys `ground_truth` is scored on.
+The prompt roughly doubles in length — about 1,260 characters median for `fields` against
+2,260 for `interface --interface-content full`.
+
+`--like` is what keeps the builds comparable: each row lands in whichever split held its
+`row` index in the named dataset, in the same order, so the same 5,554 rows stay held out
+and prediction files under `results/` remain line-aligned with the new `test`.
+
+> One row differs from the shipped `llm-fill-ft-80-20.ds` beyond the prompt text.
+> `interfaces.jsonl` carries three `@id`s twice with different bodies, and the shipped
+> build resolved the prompt by `@id`, so row 17066 was asked for an `updateInterval` that
+> belongs to the *other* `dtmi:solar_farm_aero_drag_model:wind_sensor;1`. The builder
+> pairs record N with catalogue line N instead — which is how `0.data-gen-fill.py`
+> produced them — and asks for the two fields that row's answer actually has. Everything
+> else, `ground_truth` and `n_fields` included, reproduces bit-for-bit.
+
 ### Step 4 — Run fill-in inference
 
 ```bash
@@ -227,18 +285,27 @@ python 2.perf-eval-fill-gen-local.py --model models/Qwen2-0.5B-GRPO-Fill-In
 OLLAMA_HOST=http://10.10.10.4:11434 \
 python 2.perf-eval-fill-gen-local.py --ollama --model gpt-oss:120b
 
-# hosted, OpenAI-compatible
-export OPENAI_API_KEY=...
-python 2.perf-eval-fill-gen-gemini.py --model models/gemini-2.5-pro
+# the same rows again, hosted: Gemini on Vertex AI (gcloud ADC), or --gemini-api
+python 2.perf-eval-fill-gen-gemini.py --model gemini-2.5-pro \
+  --dataset data/llm-fill-ft-80-20.ds
+GEMINI_API_KEY=... python 2.perf-eval-fill-gen-gemini.py --gemini-api \
+  --model gemini-2.5-flash --thinking-budget 0
 ```
 
-All of them write `results/<label>/filled-output-<label>.jsonl`, one row per input
-record — including `{}` for records they could not process, which keeps the file
-line-aligned with the input — and all of them resume from the `.done` file. The Gemini
-backend reads `fill-eval.jsonl`; the local/Ollama one reads the dataset split, whose rows
-already carry both the prompt and the answer. A refused connection or an HTTP timeout is
-*not* recorded as a failed record: it aborts the run with nothing written for that row,
-because a server that is down would otherwise burn every remaining row as `{}`.
+All of them read one split of a `save_to_disk` dataset — `--dataset`, `--split test` —
+and write `results/<label>/filled-output-<label>.jsonl`, one row per input record,
+including `{}` for records they could not process, which keeps the file line-aligned with
+the input. All of them resume from the `.done` file. A refused connection, an HTTP
+timeout, an expired credential or a rate limit that outlives `--retries` is *not*
+recorded as a failed record: it aborts the run with nothing written for that row, because
+an endpoint that is down would otherwise burn every remaining row as `{}`.
+
+The Gemini backend needs `google-genai`. On Vertex AI it takes `--project` /
+`--location` (`$GOOGLE_CLOUD_PROJECT`, `$GOOGLE_CLOUD_LOCATION`) and application-default
+credentials from `gcloud auth application-default login`. Its `--max-output-tokens`
+defaults to 2048 rather than the local backend's 512 because a 2.5 model draws its
+thinking tokens from that same budget; `--thinking-budget 0` turns thinking off on the
+models that allow it.
 
 ### Step 5 — Score the predictions
 
@@ -253,13 +320,15 @@ python 2.perf-eval-result-eval.py --partial \
   --pred results/gpt-oss-120b/filled-output-gpt-oss-120b.jsonl
 ```
 
-The two fill-in backends read different inputs — `fill-eval.jsonl` (27,770 lines) and a
-split of `llm-fill-ft-80-20.ds` (5,554 rows in `test`) — and a run is line-aligned with
-whatever it read. The scorer keys on that: it loads both inputs, matches each prediction
-file to the one whose row count it has, and prints them in one table with a `gold` column
-naming the input. So the bare command still scores everything under `results/`, whichever
-backend produced it. `--split`, `--test-size` and `--seed` apply only to the
-`fill-eval.jsonl` half; `--dataset` and `--dataset-split` point at the other.
+A run is line-aligned with whatever it read, and two inputs are in play: the dataset split
+both fill-in scripts read now (5,554 rows in `test`), and `fill-eval.jsonl` (27,770
+lines), which the shipped runs under `results/sentence-transformers/` were produced
+against by the earlier jsonl-driven revision of the Gemini script. The scorer keys on the
+row count: it loads both inputs, matches each prediction file to the one whose length it
+has, and prints them in one table with a `gold` column naming the input. So the bare
+command scores everything under `results/`, old runs and new alike. `--split`,
+`--test-size` and `--seed` apply only to the `fill-eval.jsonl` half; `--dataset` and
+`--dataset-split` point at the other.
 
 `--partial` additionally scores a file that stops short of the end, over the prefix it
 reached: rows are appended in input order, so an unfinished run still yields a number for
