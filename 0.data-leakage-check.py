@@ -183,6 +183,56 @@ def split_indices(n_rows: int, test_size: float, seed: int) -> Dict[str, List[in
     return {name: [int(i) for i in shards[name]["row"]] for name in ("train", "test")}
 
 
+def shard_indices(split_dir: str, n_rows: int) -> Dict[str, List[int]]:
+    """Row numbers of each shard, read from a materialised `save_to_disk` split.
+
+    The preferred way to say which rows the model saw. `split_indices` re-derives
+    a split from `test_size`/`seed` and is only as true as those two numbers being
+    the ones training used; a saved DatasetDict carries the answer in its `row`
+    column, so the audit consumes the same shards the fine-tune and the fill-in
+    evaluations did rather than a reconstruction that happens to agree.
+
+    `row` is the 0-based line index into the source JSONL (see
+    `0.data-gen-fill-ft-dataset.py`), which is what lets the shards address
+    records the saved dataset itself does not carry - the raw anchor text.
+    """
+    try:
+        from datasets import load_from_disk
+    except ImportError as exc:
+        raise SystemExit("[ERROR] `datasets` is required to read --split-dir.") from exc
+
+    dataset = load_from_disk(split_dir)
+    out: Dict[str, List[int]] = {}
+    for name in ("train", "test"):
+        if name not in dataset:
+            raise SystemExit(f"[ERROR] {split_dir} has no '{name}' split; the audit needs "
+                             "both a model-seen and a held-out shard.")
+        shard = dataset[name]
+        if "row" not in shard.column_names:
+            raise SystemExit(f"[ERROR] {split_dir}[{name}] has no `row` column, so its rows "
+                             "cannot be joined back to --data. Rebuild it with "
+                             "0.data-gen-fill-ft-dataset.py.")
+        out[name] = [int(i) for i in shard["row"]]
+
+    seen = sorted(out["train"] + out["test"])
+    duplicated = len(seen) - len(set(seen))
+    if duplicated:
+        raise SystemExit(f"[ERROR] {split_dir} repeats {duplicated} row index(es) across or "
+                         "within its shards: the shards are not a partition, and every "
+                         "overlap count below would be meaningless.")
+    if seen and (seen[0] < 0 or seen[-1] >= n_rows):
+        raise SystemExit(f"[ERROR] {split_dir} references row indices outside --data "
+                         f"(0..{n_rows - 1}). The two were built from different corpora.")
+    if len(seen) != n_rows:
+        # Not fatal: a rebuild may legitimately drop rows (an unresolvable interface,
+        # say). But the dropped rows are audited as neither seen nor held out, so the
+        # denominators below are the shards', not the file's, and that has to be said.
+        print(f"[WARN] {split_dir} covers {len(seen)} of the {n_rows} records in --data; "
+              f"{n_rows - len(seen)} row(s) belong to neither shard and are excluded "
+              "from both partitions.")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Normalisation - what "identical" means for each deterministic check
 # ---------------------------------------------------------------------------
@@ -786,6 +836,17 @@ def percent(count: int, total: int) -> float:
 
 
 def print_report(summary: Dict[str, Any]) -> None:
+    # The corpus is full of non-breaking hyphens and curly quotes, and a judge
+    # reason quotes them back. On a console that is not UTF-8 - the Windows
+    # default is cp1252 - printing one raises, which would throw the whole report
+    # away after hours of judging. Characters the console cannot encode are
+    # replaced; losing a hyphen from a printed reason costs nothing, and the
+    # verbatim text is in summary.json and llm-cache.jsonl either way.
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+
+    def safe(text: str) -> str:
+        return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
     def line(label: str, value: str) -> None:
         print(f"  {label:<44} {value}")
 
@@ -803,7 +864,10 @@ def print_report(summary: Dict[str, Any]) -> None:
     audited = "" if not sizes.get("evaluation_sampled") else f"  (audited: {sizes['evaluation_audited']})"
     line(f"evaluation partition (shard '{sizes['held_out_shard']}', held out)",
          f"{n_eval}{audited}")
-    line("split", f"train_test_split(test_size={sizes['test_size']}, seed={sizes['seed']})")
+    if sizes.get("split_dir"):
+        line("split", f"shards as saved in {sizes['split_dir']}")
+    else:
+        line("split", f"train_test_split(test_size={sizes['test_size']}, seed={sizes['seed']})")
 
     print("\n" + "-" * 78)
     print("1. DETERMINISTIC EVIDENCE  (proofs; percentages are of audited evaluation samples)")
@@ -909,7 +973,7 @@ def print_report(summary: Dict[str, Any]) -> None:
         for item in examples.get("llm_flagged", []):
             print(f"  eval {item['eval_row']:>6} <- train {item['train_row']:>6}  "
                   f"cos {item['similarity']:.3f}  conf {item['confidence']}")
-            print(f"          {item['reason'][:140]}")
+            print(f"          {safe(str(item['reason']))[:140]}")
         if examples.get("truncated"):
             print(f"\n  ... {examples['truncated']} more; the full set is in audit.jsonl "
                   "and llm-cache.jsonl.")
@@ -936,11 +1000,19 @@ def main() -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--data", default=DEFAULT_DATA, help="JSONL of {anchor, answer} records")
     parser.add_argument("--out-dir", default=DEFAULT_OUT, help="Directory for audit outputs")
+    parser.add_argument("--split-dir", default=None,
+                        help="A `save_to_disk` DatasetDict whose train/test shards carry a "
+                             "`row` column indexing --data (e.g. data/llm-fill-ft-80-20.ds). "
+                             "Its shards are used verbatim and --test-size/--seed are ignored")
     parser.add_argument("--test-size", type=float, default=SPLIT_TEST_SIZE,
-                        help="Fraction held out by train_test_split (must match training)")
-    parser.add_argument("--seed", type=int, default=SPLIT_SEED, help="Split seed")
-    parser.add_argument("--trained-shard", choices=["train", "test"], default=TRAINED_SHARD,
-                        help="Which shard the released model trained on")
+                        help="Fraction held out by train_test_split (must match training). "
+                             "Ignored when --split-dir is given")
+    parser.add_argument("--seed", type=int, default=SPLIT_SEED,
+                        help="Split seed. Ignored when --split-dir is given")
+    parser.add_argument("--trained-shard", choices=["train", "test"], default=None,
+                        help="Which shard the released model trained on "
+                             f"(default: '{TRAINED_SHARD}', or 'train' with --split-dir, "
+                             "which is the 80%% shard 1.fine-tune-GRPO-llm.py trains on)")
     parser.add_argument("--limit", type=int, default=0,
                         help="Audit only the first N evaluation samples in shard order "
                              "(a uniform random subsample; 0 = all)")
@@ -992,21 +1064,33 @@ def main() -> int:
     if not os.path.exists(args.data):
         print(f"[ERROR] Dataset not found: {args.data}")
         return 2
+    if args.split_dir and not os.path.exists(args.split_dir):
+        print(f"[ERROR] Split directory not found: {args.split_dir}")
+        return 2
+    # The 30% shard was the trained one only under the old in-script split. A saved
+    # split is consumed by 1.fine-tune-GRPO-llm.py as train=model-seen, test=held-out,
+    # so that is the default there - overridable, never silently inverted.
+    trained_shard = args.trained_shard or ("train" if args.split_dir else TRAINED_SHARD)
     pathlib.Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     records = load_jsonl(args.data)
     if not records:
         print(f"[ERROR] {args.data} holds no records.")
         return 2
-    shards = split_indices(len(records), args.test_size, args.seed)
-    held_out = "train" if args.trained_shard == "test" else "test"
-    train_rows = shards[args.trained_shard]
+    if args.split_dir:
+        shards = shard_indices(args.split_dir, len(records))
+        split_description = f"shards read from {args.split_dir}"
+    else:
+        shards = split_indices(len(records), args.test_size, args.seed)
+        split_description = f"train_test_split(test_size={args.test_size}, seed={args.seed})"
+    held_out = "train" if trained_shard == "test" else "test"
+    train_rows = shards[trained_shard]
     eval_rows_all = shards[held_out]
     eval_rows = eval_rows_all[:args.limit] if args.limit else eval_rows_all
 
     print(f"[INFO] {len(records)} records from {args.data}")
-    print(f"[INFO] train_test_split(test_size={args.test_size}, seed={args.seed}): "
-          f"training partition = shard '{args.trained_shard}' ({len(train_rows)} rows, "
+    print(f"[INFO] {split_description}: "
+          f"training partition = shard '{trained_shard}' ({len(train_rows)} rows, "
           f"model-seen), evaluation partition = shard '{held_out}' "
           f"({len(eval_rows_all)} rows, held out)")
     if args.limit:
@@ -1030,9 +1114,10 @@ def main() -> int:
             "evaluation_partition": len(eval_rows_all),
             "evaluation_audited": len(eval_rows),
             "evaluation_sampled": bool(args.limit),
-            "test_size": args.test_size,
-            "seed": args.seed,
-            "trained_shard": args.trained_shard,
+            "split_dir": args.split_dir,
+            "test_size": None if args.split_dir else args.test_size,
+            "seed": None if args.split_dir else args.seed,
+            "trained_shard": trained_shard,
             "held_out_shard": held_out,
         },
         "deterministic": det_summary,

@@ -23,7 +23,7 @@ from sentence_transformers.evaluation import SimilarityFunction
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dependencies.SuperTripletEvaluator import SuperTripletEvaluator  # noqa: E402
 
-DEFAULT_DATAFILE = os.path.join("data", "triplet.jsonl")
+DEFAULT_DATAFILE = os.path.join("data", "triplet-real-v2.jsonl")
 DEFAULT_MODELS = [
     "all-MiniLM-L6-v2",
     "all-MiniLM-L12-v2",
@@ -32,7 +32,10 @@ DEFAULT_MODELS = [
     "all-distilroberta-v1",
     "multi-qa-distilbert-cos-v1",
     "multi-qa-MiniLM-L6-cos-v1",
-    "./models/MiniLM-L6-based-new-triplets-final",
+    # "./models/MiniLM-L6-based-new-triplets-final",
+    "microsoft/deberta-base-mnli",
+    "./models/deberta-base-FT",
+    "./models/MiniLM-L6-based-FT",
 ]
 
 
@@ -53,12 +56,12 @@ def main() -> None:
     test_dataset = train_testvalid["test"].train_test_split(test_size=0.5, seed=args.seed)["test"]
     if args.limit:
         test_dataset = test_dataset.select(range(min(args.limit, len(test_dataset))))
-    print(f"[INFO] Evaluating on {len(test_dataset)} held-out triplets\n")
+    print(f"[INFO] Evaluating on {len(full_dataset)} held-out triplets\n")
 
     evaluator = SuperTripletEvaluator(
-        anchors=test_dataset["query"],
-        positives=test_dataset["positive"],
-        negatives=test_dataset["negative"],
+        anchors=full_dataset["query"],
+        positives=full_dataset["positive"],
+        negatives=full_dataset["negative"],
         main_similarity_function=SimilarityFunction.COSINE,
         name="triplet-test",
     )

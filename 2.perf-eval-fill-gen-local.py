@@ -44,8 +44,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dependencies import fill_eval_runner as runner  # noqa: E402
 
-DEFAULT_DATASET = os.environ.get("FILL_DATASET", os.path.join("data", "llm-fill-ft-80-20-iface.ds"))
-DEFAULT_MODEL = os.environ.get("LOCAL_MODEL", "models/Qwen2-0.5B-FT")
+DEFAULT_DATASET = os.environ.get("FILL_DATASET", os.path.join("data", "llm-fill-ft-80-20.ds"))
+DEFAULT_MODEL = os.environ.get("LOCAL_MODEL", "Qwen/Qwen2-0.5B-Instruct")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://10.10.10.4:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
 

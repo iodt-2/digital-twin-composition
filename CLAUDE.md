@@ -109,12 +109,13 @@ Four invariants hold the pipeline together. Most bugs here are violations of one
 
 ## Do not silently change
 
-- **`1.fine-tune-GRPO-llm.py --reward shipped`.** It is deliberately buggy: only fenced
+- **`1.fine-tune-GRPO-llm.py`'s `reward_shipped`.** It is deliberately buggy: only fenced
   ` ```json ` output is scored, the bare-JSON branch raises `TypeError` and lands at
   `-1`, so a perfect answer caps at 0.8. That cap *is* the plateau in
   `results/llm-fill-in/reward.csv`, and the published model card explains it at length.
-  Fixing it in place would make the card wrong and the checkpoint unreproducible. The
-  corrected implementation already exists as `--reward corrected`; point people there.
+  Fixing it in place would make the card wrong and the checkpoint unreproducible. It is
+  the only reward the script ships; a corrected one belongs in a new run, not in this
+  function.
 
 - **The flat fill-in prompt.** `dependencies/fill_eval_runner.build_prompt` and
   `1.model-push-to-huggingface.build_prompt` are character-for-character identical on
@@ -196,9 +197,9 @@ Four invariants hold the pipeline together. Most bugs here are violations of one
 ## Environment
 
 Windows, PowerShell, Python 3.14 in `.venv`. Installed: torch 2.12, transformers 5.12,
-sentence-transformers 5.6, datasets 5.0, faiss, sklearn, huggingface-hub. **Not
-installed**: `trl`, `wandb`, `flask` — the GRPO and Flask stages cannot run here without
-installing them first.
+sentence-transformers 5.6, datasets 5.0, faiss, sklearn, huggingface-hub, and matplotlib
+3.11 (`2.perf-eval-fill-plot.py` only). **Not installed**: `trl`, `wandb`, `flask` — the
+GRPO and Flask stages cannot run here without installing them first.
 
 `transformers` 5.x renamed `torch_dtype` to `dtype`; `sentence_transformers` deprecated
 `main_distance_function` in favour of `main_similarity_function`. Both are already

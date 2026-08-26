@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dependencies import fill_eval_runner as runner  # noqa: E402
 
 DEFAULT_DATASET = os.environ.get("FILL_DATASET", os.path.join("data", "llm-fill-ft-80-20.ds"))
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 # No project id in the source: it is a CLI flag with an env-var default, like every
 # other host in this repo.
 DEFAULT_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "iodt2-497608")
